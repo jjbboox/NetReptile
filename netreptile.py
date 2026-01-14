@@ -193,8 +193,58 @@ def load_config(config_path):
         raise
 
 
-def parse_arguments():
-    """Parse command line arguments."""
+async def main_async_with_args(args):
+    """Main async function that takes already parsed arguments."""
+    # Set logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose mode enabled")
+    
+    # Load configuration from file if specified
+    config = {}
+    if args.config:
+        try:
+            config = load_config(args.config)
+            logger.info(f"Configuration loaded: {config}")
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+            sys.exit(1)
+    
+    # Determine final parameter values (command line overrides config)
+    timeout = args.timeout if args.timeout is not None else config.get('timeout', 30000)
+    selector = args.selector if args.selector is not None else config.get('selector')
+    selector_type = args.selector_type if args.selector_type is not None else config.get('selector_type', 'css')
+    
+    logger.debug(f"Final parameters - timeout: {timeout}, selector: {selector}, selector_type: {selector_type}")
+    
+    # Validate URL
+    print(f"args.url: {args.url}")
+    if not args.url.startswith(('http://', 'https://')):
+        logger.warning(f"URL doesn't start with http:// or https://: {args.url}")
+        # Try to add https:// if missing
+        args.url = f"https://{args.url}"
+        logger.info(f"Trying with: {args.url}")
+    
+    try:
+        # Fetch page content
+        content = await fetch_page_content(
+            args.url, 
+            timeout, 
+            selector=selector,
+            selector_type=selector_type
+        )
+        
+        # Save to file
+        save_content(content, args.output_file)
+        
+    except Exception as e:
+        logger.error(f"Failed to process {args.url}: {e}")
+        sys.exit(1)
+
+
+def main():
+    """Main entry point."""
+    # Parse arguments synchronously first to handle --help without entering async context
     parser = argparse.ArgumentParser(
         description='Fetch web page content using Playwright and save to file',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -249,70 +299,52 @@ Examples:
         help='Enable verbose logging'
     )
     
-    return parser.parse_args()
-
-
-async def main_async():
-    """Main async function."""
-    args = parse_arguments()
+    # Parse arguments
+    args = parser.parse_args()
     
-    # Set logging level
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Verbose mode enabled")
+    # Handle Windows-specific asyncio issues
+    if sys.platform == 'win32':
+        # Try to use ProactorEventLoop for better Windows compatibility
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     
-    # Load configuration from file if specified
-    config = {}
-    if args.config:
+    loop = None
+    try:
+        # Get or create event loop
         try:
-            config = load_config(args.config)
-            logger.info(f"Configuration loaded: {config}")
-        except Exception as e:
-            logger.error(f"Failed to load configuration: {e}")
-            sys.exit(1)
-    
-    # Determine final parameter values (command line overrides config)
-    timeout = args.timeout if args.timeout is not None else config.get('timeout', 30000)
-    selector = args.selector if args.selector is not None else config.get('selector')
-    selector_type = args.selector_type if args.selector_type is not None else config.get('selector_type', 'css')
-    
-    logger.debug(f"Final parameters - timeout: {timeout}, selector: {selector}, selector_type: {selector_type}")
-    
-    # Validate URL
-    print(f"args.url: {args.url}")
-    if not args.url.startswith(('http://', 'https://')):
-        logger.warning(f"URL doesn't start with http:// or https://: {args.url}")
-        # Try to add https:// if missing
-        args.url = f"https://{args.url}"
-        logger.info(f"Trying with: {args.url}")
-    
-    try:
-        # Fetch page content
-        content = await fetch_page_content(
-            args.url, 
-            timeout, 
-            selector=selector,
-            selector_type=selector_type
-        )
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         
-        # Save to file
-        save_content(content, args.output_file)
+        # Run the main async function with the parsed arguments
+        loop.run_until_complete(main_async_with_args(args))
         
-    except Exception as e:
-        logger.error(f"Failed to process {args.url}: {e}")
-        sys.exit(1)
-
-
-def main():
-    """Main entry point."""
-    try:
-        asyncio.run(main_async())
     except KeyboardInterrupt:
         logger.info("Operation cancelled by user")
         sys.exit(130)
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         sys.exit(1)
+    finally:
+        # Clean up the event loop
+        if loop:
+            try:
+                # Cancel all running tasks
+                tasks = asyncio.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                
+                # Run loop until all tasks are cancelled
+                if tasks:
+                    loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+                
+                # Shutdown async generators
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                
+                # Close the loop
+                loop.close()
+            except Exception:
+                pass  # Ignore errors during cleanup
 
 
 if __name__ == "__main__":
