@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def fetch_page_content(url: str, timeout: int = 30000, selector: str = None, selector_type: str = 'css') -> str:
+async def fetch_page_content(url: str, timeout: int = 30000, selector: str = None, selector_type: str = 'css') -> dict:
     """
     Fetch web page content using Playwright.
     
@@ -47,7 +47,10 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
         selector_type: Type of selector - 'css' or 'xpath' (default: 'css')
         
     Returns:
-        The page HTML content as a string, or extracted text if selector is provided
+        A dictionary containing:
+        - 'content': The page HTML content as a string, or extracted text if selector is provided
+        - 'timeout_occurred': Boolean indicating if a timeout occurred during navigation
+        - 'url': The URL that was fetched
     """
     async with async_playwright() as p:
         # Launch browser (Chromium by default)
@@ -93,7 +96,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                 
                 if not elements:
                     logger.warning(f"No elements found matching selector: {selector}")
-                    return ""
+                    return {"content": "", "timeout_occurred": navigation_timeout_occurred, "url": url}
                 
                 # Extract text from all matching elements
                 extracted_texts = []
@@ -108,7 +111,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                 
                 if not extracted_texts:
                     logger.warning("No text content found in matching elements")
-                    return ""
+                    return {"content": "", "timeout_occurred": navigation_timeout_occurred, "url": url}
                 
                 # Join all extracted texts with separators
                 separator = "\n" + "="*80 + "\n"
@@ -120,7 +123,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                 content = await page.content()
                 logger.info(f"Successfully fetched full HTML content from {url}")
             
-            return content
+            return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
             
         except Exception as e:
             logger.error(f"Error fetching {url}: {e}")
@@ -254,6 +257,34 @@ def load_url_list(list_file):
         raise
 
 
+def format_content_with_timeout_markers(result):
+    """
+    Format content with timeout markers if timeout occurred.
+    
+    Args:
+        result: Dictionary containing 'content', 'timeout_occurred', and 'url'
+        
+    Returns:
+        str: Formatted content with timeout markers if applicable
+    """
+    content = result.get('content', '')
+    timeout_occurred = result.get('timeout_occurred', False)
+    url = result.get('url', 'Unknown URL')
+    
+    if not timeout_occurred:
+        return content
+    
+    # Create timeout markers
+    timeout_marker = "=" * 80
+    timeout_header = f"TIMEOUT OCCURRED - Content may be incomplete\nURL: {url}\n"
+    timeout_footer = f"END OF TIMEOUT CONTENT - URL: {url}\n"
+    
+    # Format content with timeout markers
+    formatted_content = f"\n{timeout_marker}\n{timeout_header}{timeout_marker}\n\n{content}\n\n{timeout_marker}\n{timeout_footer}{timeout_marker}\n"
+    
+    return formatted_content
+
+
 async def process_single_url(url, timeout, selector, selector_type, baseurl=None):
     """
     Process a single URL and return its content.
@@ -266,7 +297,7 @@ async def process_single_url(url, timeout, selector, selector_type, baseurl=None
         baseurl: Base URL to prepend to relative URLs (optional)
         
     Returns:
-        str: Extracted content
+        dict: Dictionary containing content, timeout status and URL, or None if failed
     """
     # Apply baseurl if provided and URL is relative
     if baseurl and not url.startswith(('http://', 'https://', '//')):
@@ -288,13 +319,13 @@ async def process_single_url(url, timeout, selector, selector_type, baseurl=None
         logger.info(f"Trying with: {url}")
     
     try:
-        content = await fetch_page_content(
+        result = await fetch_page_content(
             url, 
             timeout, 
             selector=selector,
             selector_type=selector_type
         )
-        return content
+        return result
     except Exception as e:
         logger.error(f"Failed to process {url}: {e}")
         return None
@@ -358,13 +389,16 @@ async def main_async_with_args(args):
                 print(f"[{i}/{len(urls)}] Processing: {url}")
                 logger.info(f"Processing URL {i}/{len(urls)}: {url}")
                 
-                content = await process_single_url(url, timeout, selector, selector_type, baseurl)
+                result = await process_single_url(url, timeout, selector, selector_type, baseurl)
                 
-                if content is not None:
+                if result is not None:
                     successful_urls += 1
                     
+                    # Format content with timeout markers if needed
+                    formatted_content = format_content_with_timeout_markers(result)
+                    
                     # Add URL header and separator
-                    url_header = f"\n{'='*80}\nURL {i}: {url}\n{'='*80}\n"
+                    url_header = "\n"*4
                     
                     # Append content to output file immediately
                     with open(args.output_file, 'a', encoding='utf-8') as f:
@@ -373,9 +407,14 @@ async def main_async_with_args(args):
                         else:  # First URL, just write header without leading newline
                             f.write(url_header.lstrip())
                         
-                        f.write(content)
+                        f.write(formatted_content)
                     
-                    print(f"[{i}/{len(urls)}] Successfully processed and saved: {url}")
+                    # Log timeout status if occurred
+                    if result.get('timeout_occurred', False):
+                        logger.warning(f"Timeout occurred while processing {url} - content marked with timeout indicators")
+                        print(f"[{i}/{len(urls)}] Timeout occurred - content saved with timeout markers: {url}")
+                    else:
+                        print(f"[{i}/{len(urls)}] Successfully processed and saved: {url}")
             
             if successful_urls == 0:
                 logger.error("Failed to process any URLs from the list")
@@ -393,14 +432,22 @@ async def main_async_with_args(args):
         print(f"args.url: {args.url}")
         
         try:
-            content = await process_single_url(args.url, timeout, selector, selector_type, baseurl)
+            result = await process_single_url(args.url, timeout, selector, selector_type, baseurl)
             
-            if content is None:
+            if result is None:
                 logger.error(f"Failed to process {args.url}")
                 sys.exit(1)
             
+            # Format content with timeout markers if needed
+            formatted_content = format_content_with_timeout_markers(result)
+            
             # Save to file
-            save_content(content, args.output_file)
+            save_content(formatted_content, args.output_file)
+            
+            # Log timeout status if occurred
+            if result.get('timeout_occurred', False):
+                logger.warning(f"Timeout occurred while processing {args.url} - content marked with timeout indicators")
+                print(f"Timeout occurred - content saved with timeout markers: {args.url}")
             
         except Exception as e:
             logger.error(f"Failed to process {args.url}: {e}")
