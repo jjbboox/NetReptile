@@ -17,6 +17,7 @@ Container Extraction Examples:
 import asyncio
 import sys
 import argparse
+import json
 from pathlib import Path
 from playwright.async_api import async_playwright
 import logging
@@ -51,14 +52,29 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
         )
         page = await context.new_page()
         
+        navigation_timeout_occurred = False
+        
         try:
             logger.info(f"Navigating to {url}")
-            await page.goto(url, wait_until='networkidle', timeout=timeout)
+            try:
+                await page.goto(url, wait_until='networkidle', timeout=timeout)
+            except TimeoutError as e:
+                logger.warning(f"Navigation timeout occurred: {e}")
+                logger.info("Stopping page loading and continuing with already loaded content...")
+                navigation_timeout_occurred = True
+                # Stop page loading
+                await page.evaluate("window.stop()")
             
-            # Wait for any dynamic content to load
-            await page.wait_for_load_state('networkidle')
+            # Wait for any dynamic content to load (with timeout handling)
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5000)  # Shorter timeout for load state
+            except TimeoutError as e:
+                if not navigation_timeout_occurred:
+                    logger.warning(f"Load state timeout occurred: {e}")
+                    logger.info("Continuing with current page state...")
             
             # If selector is provided, extract text from matching elements
+            print(f"selector: ", selector)
             if selector:
                 logger.info(f"Extracting text from containers matching selector: {selector} (type: {selector_type})")
                 
@@ -130,6 +146,53 @@ def save_content(content: str, output_file: str) -> None:
         raise
 
 
+def load_config(config_path):
+    """
+    Load configuration from a JSON file.
+    
+    Args:
+        config_path: Path to the JSON configuration file
+        
+    Returns:
+        dict: Configuration dictionary with keys: timeout, selector, selector_type
+    """
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        # Validate and normalize config
+        valid_config = {}
+        
+        if 'timeout' in config:
+            try:
+                valid_config['timeout'] = int(config['timeout'])
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid timeout value in config: {config['timeout']}, using default")
+        
+        if 'selector' in config:
+            valid_config['selector'] = str(config['selector'])
+        
+        if 'selector_type' in config:
+            selector_type = str(config['selector_type']).lower()
+            if selector_type in ['css', 'xpath']:
+                valid_config['selector_type'] = selector_type
+            else:
+                logger.warning(f"Invalid selector_type in config: {config['selector_type']}, using default")
+        
+        logger.info(f"Loaded configuration from {config_path}")
+        return valid_config
+        
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found: {config_path}")
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in configuration file {config_path}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error loading configuration from {config_path}: {e}")
+        raise
+
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -141,6 +204,8 @@ Examples:
   %(prog)s "https://www.google.com" google.html --timeout 60000
   %(prog)s https://news.example.com news.txt --selector ".article-content"
   %(prog)s https://forum.example.com posts.txt --selector "//div[@class='post']" --selector-type xpath
+  %(prog)s https://example.com output.html --config config.json
+  %(prog)s https://example.com output.html --config config.json --timeout 50000
         """
     )
     
@@ -155,22 +220,27 @@ Examples:
     )
     
     parser.add_argument(
+        '--config',
+        help='Path to JSON configuration file (can contain timeout, selector, selector_type)'
+    )
+    
+    parser.add_argument(
         '--timeout',
         type=int,
-        default=30000,
-        help='Navigation timeout in milliseconds (default: 30000)'
+        default=None,
+        help='Navigation timeout in milliseconds (overrides config file if provided)'
     )
     
     parser.add_argument(
         '--selector',
-        help='CSS selector or XPath to find specific containers for text extraction'
+        help='CSS selector or XPath to find specific containers for text extraction (overrides config file if provided)'
     )
     
     parser.add_argument(
         '--selector-type',
         choices=['css', 'xpath'],
-        default='css',
-        help='Type of selector: css or xpath (default: css)'
+        default=None,
+        help='Type of selector: css or xpath (overrides config file if provided)'
     )
     
     parser.add_argument(
@@ -191,7 +261,25 @@ async def main_async():
         logging.getLogger().setLevel(logging.DEBUG)
         logger.debug("Verbose mode enabled")
     
+    # Load configuration from file if specified
+    config = {}
+    if args.config:
+        try:
+            config = load_config(args.config)
+            logger.info(f"Configuration loaded: {config}")
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
+            sys.exit(1)
+    
+    # Determine final parameter values (command line overrides config)
+    timeout = args.timeout if args.timeout is not None else config.get('timeout', 30000)
+    selector = args.selector if args.selector is not None else config.get('selector')
+    selector_type = args.selector_type if args.selector_type is not None else config.get('selector_type', 'css')
+    
+    logger.debug(f"Final parameters - timeout: {timeout}, selector: {selector}, selector_type: {selector_type}")
+    
     # Validate URL
+    print(f"args.url: {args.url}")
     if not args.url.startswith(('http://', 'https://')):
         logger.warning(f"URL doesn't start with http:// or https://: {args.url}")
         # Try to add https:// if missing
@@ -202,9 +290,9 @@ async def main_async():
         # Fetch page content
         content = await fetch_page_content(
             args.url, 
-            args.timeout, 
-            selector=args.selector,
-            selector_type=args.selector_type
+            timeout, 
+            selector=selector,
+            selector_type=selector_type
         )
         
         # Save to file
