@@ -1,5 +1,0 @@
-{
-    "timeout": 50000,
-    "selector": "//div[@class='content-section']",
-    "selector_type": "xpath"
-}
