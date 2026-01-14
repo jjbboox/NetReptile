@@ -71,10 +71,78 @@ python netreptile.py https://magazine.example.com articles.txt --selector ".arti
 
 - `url`: The URL of the web page to fetch (required)
 - `output_file`: Path to the output file where content will be saved (required)
-- `--timeout`: Navigation timeout in milliseconds (default: 30000)
-- `--selector`: CSS selector or XPath to find specific containers for text extraction (optional)
-- `--selector-type`: Type of selector: 'css' or 'xpath' (default: 'css')
+- `--config`: Path to JSON configuration file (can contain timeout, selector, selector_type)
+- `--timeout`: Navigation timeout in milliseconds (overrides config file if provided, default: 30000)
+- `--selector`: CSS selector or XPath to find specific containers for text extraction (overrides config file if provided, optional)
+- `--selector-type`: Type of selector: 'css' or 'xpath' (overrides config file if provided, default: 'css')
 - `--verbose`: Enable verbose logging
+
+## Configuration File
+
+You can use a JSON configuration file to specify `timeout`, `selector`, and `selector_type` parameters. Command line arguments override configuration file values.
+
+### Configuration File Format
+
+Create a JSON file with the following structure:
+
+```json
+{
+    "timeout": 45000,
+    "selector": ".article-content",
+    "selector_type": "css"
+}
+```
+
+- `timeout`: Navigation timeout in milliseconds (integer)
+- `selector`: CSS selector or XPath string (string)
+- `selector_type`: "css" or "xpath" (string, optional, default: "css")
+
+### Examples
+
+**Using configuration file:**
+```bash
+# Load parameters from config.json
+python netreptile.py https://example.com output.html --config config.json
+
+# Load from config.json but override timeout via command line
+python netreptile.py https://example.com output.html --config config.json --timeout 60000
+
+# Load from config.json but override selector via command line
+python netreptile.py https://example.com output.html --config config.json --selector ".main-content"
+```
+
+**Configuration file examples:**
+
+`config_news.json`:
+```json
+{
+    "timeout": 60000,
+    "selector": ".article-content",
+    "selector_type": "css"
+}
+```
+
+`config_forum.json`:
+```json
+{
+    "timeout": 30000,
+    "selector": "//div[@class='post']",
+    "selector_type": "xpath"
+}
+```
+
+`config_basic.json`:
+```json
+{
+    "timeout": 45000
+}
+```
+
+### Priority Order
+
+1. Command line arguments (highest priority)
+2. Configuration file values
+3. Default values (lowest priority)
 
 ## How It Works
 
@@ -179,9 +247,10 @@ python netreptile.py https://magazine.example.com articles.txt --selector ".arti
 
 - `url`: 要抓取的网页 URL（必需）
 - `output_file`: 保存内容的输出文件路径（必需）
-- `--timeout`: 导航超时（毫秒，默认：30000）
-- `--selector`: CSS 选择器或 XPath，用于查找要提取文本的特定容器（可选）
-- `--selector-type`: 选择器类型：'css' 或 'xpath'（默认：'css'）
+- `--config`: JSON 配置文件路径（可包含 timeout、selector、selector_type）
+- `--timeout`: 导航超时（毫秒，覆盖配置文件中的设置，默认：30000）
+- `--selector`: CSS 选择器或 XPath，用于查找要提取文本的特定容器（覆盖配置文件中的设置，可选）
+- `--selector-type`: 选择器类型：'css' 或 'xpath'（覆盖配置文件中的设置，默认：'css'）
 - `--verbose`: 启用详细日志记录
 
 ## 工作原理
