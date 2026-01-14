@@ -4,6 +4,7 @@ NetReptile - A web page content fetcher using Playwright
 
 Usage:
     python netreptile.py <url> <output_file>
+    python netreptile.py --list <url_list_file> <output_file>
     
 Basic Examples:
     python netreptile.py https://example.com page.html
@@ -12,6 +13,11 @@ Basic Examples:
 Container Extraction Examples:
     python netreptile.py https://news.example.com news.txt --selector ".article-content"
     python netreptile.py https://forum.example.com posts.txt --selector "//div[@class='post']" --selector-type xpath
+
+URL List Examples:
+    python netreptile.py --list urls.txt output.txt
+    python netreptile.py --list urls.txt output.txt --config config.json
+    python netreptile.py --list urls.txt output.txt --selector ".article" --timeout 60000
 """
 
 import asyncio
@@ -30,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def fetch_page_content(url: str, timeout: int = 30000, selector: str = None, selector_type: str = 'css') -> str:
+async def fetch_page_content(url: str, timeout: int = 30000, selector: str = None, selector_type: str = 'css') -> dict:
     """
     Fetch web page content using Playwright.
     
@@ -41,7 +47,10 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
         selector_type: Type of selector - 'css' or 'xpath' (default: 'css')
         
     Returns:
-        The page HTML content as a string, or extracted text if selector is provided
+        A dictionary containing:
+        - 'content': The page HTML content as a string, or extracted text if selector is provided
+        - 'timeout_occurred': Boolean indicating if a timeout occurred during navigation
+        - 'url': The URL that was fetched
     """
     async with async_playwright() as p:
         # Launch browser (Chromium by default)
@@ -87,7 +96,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                 
                 if not elements:
                     logger.warning(f"No elements found matching selector: {selector}")
-                    return ""
+                    return {"content": "", "timeout_occurred": navigation_timeout_occurred, "url": url}
                 
                 # Extract text from all matching elements
                 extracted_texts = []
@@ -102,7 +111,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                 
                 if not extracted_texts:
                     logger.warning("No text content found in matching elements")
-                    return ""
+                    return {"content": "", "timeout_occurred": navigation_timeout_occurred, "url": url}
                 
                 # Join all extracted texts with separators
                 separator = "\n" + "="*80 + "\n"
@@ -114,7 +123,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                 content = await page.content()
                 logger.info(f"Successfully fetched full HTML content from {url}")
             
-            return content
+            return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
             
         except Exception as e:
             logger.error(f"Error fetching {url}: {e}")
@@ -154,7 +163,7 @@ def load_config(config_path):
         config_path: Path to the JSON configuration file
         
     Returns:
-        dict: Configuration dictionary with keys: timeout, selector, selector_type
+        dict: Configuration dictionary with keys: timeout, selector, selector_type, baseurl
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -179,6 +188,14 @@ def load_config(config_path):
             else:
                 logger.warning(f"Invalid selector_type in config: {config['selector_type']}, using default")
         
+        if 'baseurl' in config:
+            baseurl = str(config['baseurl']).strip()
+            # Ensure baseurl ends with a slash for proper URL concatenation
+            if baseurl and not baseurl.endswith('/'):
+                baseurl += '/'
+            valid_config['baseurl'] = baseurl
+            logger.debug(f"Loaded baseurl from config: {baseurl}")
+        
         logger.info(f"Loaded configuration from {config_path}")
         return valid_config
         
@@ -193,12 +210,141 @@ def load_config(config_path):
         raise
 
 
+def load_url_list(list_file):
+    """
+    Load URLs from a list file (one URL per line).
+    
+    Args:
+        list_file: Path to the file containing URLs
+        
+    Returns:
+        list: List of URLs
+    """
+    try:
+        with open(list_file, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        
+        urls = []
+        for line in lines:
+            # Skip comments
+            if line.startswith('#'):
+                continue
+            
+            # Check if line contains an <a href> tag
+            if '<a href=' in line.lower() or '<a href =' in line.lower():
+                # Try to extract URL from href attribute
+                import re
+                # Match href attribute with single or double quotes
+                match = re.search(r'href\s*=\s*["\']([^"\']+)["\']', line, re.IGNORECASE)
+                if match:
+                    url = match.group(1)
+                    logger.debug(f"Extracted URL from <a href> tag: {url}")
+                    urls.append(url)
+                else:
+                    logger.warning(f"Could not extract URL from <a href> tag: {line}")
+            else:
+                # Regular URL line
+                urls.append(line)
+        
+        logger.info(f"Loaded {len(urls)} URLs from {list_file}")
+        return urls
+        
+    except FileNotFoundError:
+        logger.error(f"List file not found: {list_file}")
+        raise
+    except Exception as e:
+        logger.error(f"Error loading URL list from {list_file}: {e}")
+        raise
+
+
+def format_content_with_timeout_markers(result):
+    """
+    Format content with timeout markers if timeout occurred.
+    
+    Args:
+        result: Dictionary containing 'content', 'timeout_occurred', and 'url'
+        
+    Returns:
+        str: Formatted content with timeout markers if applicable
+    """
+    content = result.get('content', '')
+    timeout_occurred = result.get('timeout_occurred', False)
+    url = result.get('url', 'Unknown URL')
+    
+    if not timeout_occurred:
+        return content
+    
+    # Create timeout markers
+    timeout_marker = "=" * 80
+    timeout_header = f"TIMEOUT OCCURRED - Content may be incomplete\nURL: {url}\n"
+    timeout_footer = f"END OF TIMEOUT CONTENT - URL: {url}\n"
+    
+    # Format content with timeout markers
+    formatted_content = f"\n{timeout_marker}\n{timeout_header}{timeout_marker}\n\n{content}\n\n{timeout_marker}\n{timeout_footer}{timeout_marker}\n"
+    
+    return formatted_content
+
+
+async def process_single_url(url, timeout, selector, selector_type, baseurl=None):
+    """
+    Process a single URL and return its content.
+    
+    Args:
+        url: URL to process
+        timeout: Navigation timeout in milliseconds
+        selector: CSS selector or XPath for text extraction
+        selector_type: Type of selector
+        baseurl: Base URL to prepend to relative URLs (optional)
+        
+    Returns:
+        dict: Dictionary containing content, timeout status and URL, or None if failed
+    """
+    # Apply baseurl if provided and URL is relative
+    if baseurl and not url.startswith(('http://', 'https://', '//')):
+        # Check if URL starts with a slash (absolute path relative to baseurl)
+        if url.startswith('/'):
+            # Remove leading slash from URL if baseurl already ends with slash
+            if baseurl.endswith('/'):
+                url = url[1:]
+        # Concatenate baseurl and URL
+        original_url = url
+        url = baseurl + url
+        logger.info(f"Applied baseurl to relative URL: {original_url} -> {url}")
+    
+    # Validate and normalize URL
+    if not url.startswith(('http://', 'https://')):
+        logger.warning(f"URL doesn't start with http:// or https://: {url}")
+        # Try to add https:// if missing
+        url = f"https://{url}"
+        logger.info(f"Trying with: {url}")
+    
+    try:
+        result = await fetch_page_content(
+            url, 
+            timeout, 
+            selector=selector,
+            selector_type=selector_type
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Failed to process {url}: {e}")
+        return None
+
+
 async def main_async_with_args(args):
     """Main async function that takes already parsed arguments."""
     # Set logging level
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.debug("Verbose mode enabled")
+    
+    # Validate arguments
+    if not args.list_file and not args.url:
+        logger.error("Either a URL or --list option must be provided")
+        print("Error: Either a URL or --list option must be provided")
+        print("Usage: python netreptile.py <url> <output_file> [options]")
+        print("       python netreptile.py --list <url_list_file> <output_file> [options]")
+        sys.exit(1)
     
     # Load configuration from file if specified
     config = {}
@@ -214,32 +360,98 @@ async def main_async_with_args(args):
     timeout = args.timeout if args.timeout is not None else config.get('timeout', 30000)
     selector = args.selector if args.selector is not None else config.get('selector')
     selector_type = args.selector_type if args.selector_type is not None else config.get('selector_type', 'css')
+    baseurl = config.get('baseurl')  # Get baseurl from config if exists
     
-    logger.debug(f"Final parameters - timeout: {timeout}, selector: {selector}, selector_type: {selector_type}")
+    logger.debug(f"Final parameters - timeout: {timeout}, selector: {selector}, selector_type: {selector_type}, baseurl: {baseurl}")
     
-    # Validate URL
-    print(f"args.url: {args.url}")
-    if not args.url.startswith(('http://', 'https://')):
-        logger.warning(f"URL doesn't start with http:// or https://: {args.url}")
-        # Try to add https:// if missing
-        args.url = f"https://{args.url}"
-        logger.info(f"Trying with: {args.url}")
+    # Process based on whether we have a list file or single URL
+    if args.list_file:
+        # Process list of URLs
+        try:
+            urls = load_url_list(args.list_file)
+            if not urls:
+                logger.error(f"No valid URLs found in {args.list_file}")
+                sys.exit(1)
+            
+            logger.info(f"Processing {len(urls)} URLs from {args.list_file}")
+            
+            successful_urls = 0
+            
+            # Create or truncate output file at the beginning
+            output_path = Path(args.output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Start with empty file
+            with open(args.output_file, 'w', encoding='utf-8') as f:
+                f.write("")
+            
+            for i, url in enumerate(urls, 1):
+                # Print progress in format [i/total]
+                print(f"[{i}/{len(urls)}] Processing: {url}")
+                logger.info(f"Processing URL {i}/{len(urls)}: {url}")
+                
+                result = await process_single_url(url, timeout, selector, selector_type, baseurl)
+                
+                if result is not None:
+                    successful_urls += 1
+                    
+                    # Format content with timeout markers if needed
+                    formatted_content = format_content_with_timeout_markers(result)
+                    
+                    # Add URL header and separator
+                    url_header = "\n"*4
+                    
+                    # Append content to output file immediately
+                    with open(args.output_file, 'a', encoding='utf-8') as f:
+                        if i > 1:  # Add separator before content if not first URL
+                            f.write(url_header)
+                        else:  # First URL, just write header without leading newline
+                            f.write(url_header.lstrip())
+                        
+                        f.write(formatted_content)
+                    
+                    # Log timeout status if occurred
+                    if result.get('timeout_occurred', False):
+                        logger.warning(f"Timeout occurred while processing {url} - content marked with timeout indicators")
+                        print(f"[{i}/{len(urls)}] Timeout occurred - content saved with timeout markers: {url}")
+                    else:
+                        print(f"[{i}/{len(urls)}] Successfully processed and saved: {url}")
+            
+            if successful_urls == 0:
+                logger.error("Failed to process any URLs from the list")
+                sys.exit(1)
+            
+            logger.info(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to {args.output_file}")
+            print(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to: {args.output_file}")
+            
+        except Exception as e:
+            logger.error(f"Failed to process URL list: {e}")
+            sys.exit(1)
     
-    try:
-        # Fetch page content
-        content = await fetch_page_content(
-            args.url, 
-            timeout, 
-            selector=selector,
-            selector_type=selector_type
-        )
+    else:
+        # Process single URL (original behavior)
+        print(f"args.url: {args.url}")
         
-        # Save to file
-        save_content(content, args.output_file)
-        
-    except Exception as e:
-        logger.error(f"Failed to process {args.url}: {e}")
-        sys.exit(1)
+        try:
+            result = await process_single_url(args.url, timeout, selector, selector_type, baseurl)
+            
+            if result is None:
+                logger.error(f"Failed to process {args.url}")
+                sys.exit(1)
+            
+            # Format content with timeout markers if needed
+            formatted_content = format_content_with_timeout_markers(result)
+            
+            # Save to file
+            save_content(formatted_content, args.output_file)
+            
+            # Log timeout status if occurred
+            if result.get('timeout_occurred', False):
+                logger.warning(f"Timeout occurred while processing {args.url} - content marked with timeout indicators")
+                print(f"Timeout occurred - content saved with timeout markers: {args.url}")
+            
+        except Exception as e:
+            logger.error(f"Failed to process {args.url}: {e}")
+            sys.exit(1)
 
 
 def main():
@@ -256,12 +468,14 @@ Examples:
   %(prog)s https://forum.example.com posts.txt --selector "//div[@class='post']" --selector-type xpath
   %(prog)s https://example.com output.html --config config.json
   %(prog)s https://example.com output.html --config config.json --timeout 50000
+  %(prog)s --list urls.txt output.txt --config config.json
         """
     )
     
     parser.add_argument(
         'url',
-        help='URL of the web page to fetch'
+        nargs='?',  # Make URL optional when --list is used
+        help='URL of the web page to fetch (ignored when --list is specified)'
     )
     
     parser.add_argument(
@@ -297,6 +511,12 @@ Examples:
         '--verbose',
         action='store_true',
         help='Enable verbose logging'
+    )
+    
+    parser.add_argument(
+        '--list',
+        dest='list_file',
+        help='Path to a file containing a list of URLs (one per line). When specified, ignores the URL argument and processes all URLs in the list.'
     )
     
     # Parse arguments

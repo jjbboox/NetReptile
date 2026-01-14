@@ -1,0 +1,6 @@
+{
+    "timeout": 50000,
+    "selector": "pre",
+    "selector_type": "css",
+    "baseurl": "https://www.cool18.com/bbs4/"
+}
