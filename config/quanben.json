@@ -1,0 +1,24 @@
+{
+    "timeout": 50000,
+    "selectors": [
+        {
+            "selector": ".headline",
+            "selector_type": "css",
+            "separator": "\n\n"
+        },
+        {
+            "selector": "//div[@id='content']",
+            "selector_type": "xpath",
+            "exclusions": ["font", ".footer"],
+            "selectors": [
+                {
+                    "selector": "p", 
+                    "selector_type": "css", 
+                    "separator": "\n"
+                }
+            ]
+        }
+    ],
+    "title": "《仙者》",
+    "baseurl": "https://www.quanben.io/"
+}
