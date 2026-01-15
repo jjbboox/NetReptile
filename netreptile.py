@@ -27,6 +27,7 @@ import json
 from pathlib import Path
 from playwright.async_api import async_playwright
 import logging
+from selector_processor import process_selectors
 
 # Configure logging
 logging.basicConfig(
@@ -183,107 +184,15 @@ async def fetch_page_content_with_selectors(url: str, timeout: int = 30000, sele
                 logger.info(f"Successfully fetched full HTML content from {url}")
                 return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
             
-            # Process each selector configuration
-            all_extracted_texts = []
+            # Use selector_processor module to process selectors
+            logger.info(f"Processing {len(selectors)} selector configurations using selector_processor")
+            content = await process_selectors(page, selectors)
             
-            for selector_config in selectors:
-                selector = selector_config.get('selector')
-                selector_type = selector_config.get('selector_type', 'css')
-                separator = selector_config.get('separator', '\n')
-                exclusions = selector_config.get('exclusions', [])
-                nested_selectors = selector_config.get('selectors', [])
-                
-                if not selector:
-                    logger.warning(f"Missing selector in config: {selector_config}")
-                    continue
-                
-                logger.info(f"Extracting text with selector: {selector} (type: {selector_type})")
-                
-                # Find elements based on selector type
-                if selector_type == 'css':
-                    elements = await page.query_selector_all(selector)
-                elif selector_type == 'xpath':
-                    elements = await page.query_selector_all(f'xpath={selector}')
-                else:
-                    logger.warning(f"Unsupported selector type: {selector_type}, skipping")
-                    continue
-                
-                if not elements:
-                    logger.warning(f"No elements found matching selector: {selector}")
-                    continue
-                
-                # Process each element
-                for i, element in enumerate(elements):
-                    try:
-                        # Apply exclusions if specified
-                        if exclusions:
-                            # Create a copy of the element to work with
-                            element_copy = element
-                            # Remove excluded elements
-                            for exclusion in exclusions:
-                                if exclusion.startswith('.'):
-                                    # CSS class exclusion
-                                    excluded_elements = await element_copy.query_selector_all(exclusion)
-                                else:
-                                    # Tag name exclusion
-                                    excluded_elements = await element_copy.query_selector_all(exclusion)
-                                
-                                for excluded in excluded_elements:
-                                    try:
-                                        await excluded.evaluate("node => node.remove()")
-                                    except Exception as e:
-                                        logger.debug(f"Failed to remove excluded element: {e}")
-                        
-                        # If nested selectors are specified, extract from them
-                        if nested_selectors:
-                            nested_texts = []
-                            for nested_config in nested_selectors:
-                                nested_selector = nested_config.get('selector')
-                                nested_selector_type = nested_config.get('selector_type', 'css')
-                                nested_separator = nested_config.get('separator', '\n')
-                                
-                                if not nested_selector:
-                                    continue
-                                
-                                # Find nested elements
-                                if nested_selector_type == 'css':
-                                    nested_elements = await element.query_selector_all(nested_selector)
-                                elif nested_selector_type == 'xpath':
-                                    nested_elements = await element.query_selector_all(f'xpath={nested_selector}')
-                                else:
-                                    continue
-                                
-                                # Extract text from nested elements
-                                for nested_element in nested_elements:
-                                    try:
-                                        text = await nested_element.text_content()
-                                        if text and text.strip():
-                                            nested_texts.append(text.strip())
-                                    except Exception as e:
-                                        logger.debug(f"Failed to extract text from nested element: {e}")
-                            
-                            if nested_texts:
-                                # Join nested texts with their separator
-                                # nested_content = nested_separator.join(nested_texts)
-                                nested_content = nested_separator.join(nested_texts)
-                                all_extracted_texts.append(nested_content)
-                        else:
-                            # Extract text directly from the element
-                            text = await element.text_content()
-                            if text and text.strip():
-                                all_extracted_texts.append(text.strip())
-                                
-                    except Exception as e:
-                        logger.warning(f"Failed to process element {i+1}: {e}")
-            
-            if not all_extracted_texts:
+            if not content:
                 logger.warning("No text content extracted from any selectors")
                 return {"content": "", "timeout_occurred": navigation_timeout_occurred, "url": url}
             
-            # Join all extracted texts with default separator
-            content = "\n".join(all_extracted_texts)
             logger.info(f"Successfully extracted text using {len(selectors)} selector configurations")
-            
             return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
             
         except Exception as e:
@@ -358,6 +267,9 @@ def load_config(config_path):
             else:
                 logger.warning(f"Invalid selectors format in config, expected array")
         
+        if 'title' in config:
+            valid_config['title'] = str(config['title'])
+            
         if 'baseurl' in config:
             baseurl = str(config['baseurl']).strip()
             # Ensure baseurl ends with a slash for proper URL concatenation
@@ -471,7 +383,7 @@ async def process_single_url(url, timeout, selector=None, selector_type='css', b
         dict: Dictionary containing content, timeout status and URL, or None if failed
     """
     # Apply baseurl if provided and URL is relative
-    if baseurl and not url.startswith(('http://', 'https://', '//')):
+    if baseurl and not url.startswith(('http://', 'https://', 'file://', '//')):
         # Check if URL starts with a slash (absolute path relative to baseurl)
         if url.startswith('/'):
             # Remove leading slash from URL if baseurl already ends with slash
@@ -483,8 +395,8 @@ async def process_single_url(url, timeout, selector=None, selector_type='css', b
         logger.info(f"Applied baseurl to relative URL: {original_url} -> {url}")
     
     # Validate and normalize URL
-    if not url.startswith(('http://', 'https://')):
-        logger.warning(f"URL doesn't start with http:// or https://: {url}")
+    if not url.startswith(('http://', 'https://', 'file://')):
+        logger.warning(f"URL doesn't start with http://, https:// or file://: {url}")
         # Try to add https:// if missing
         url = f"https://{url}"
         logger.info(f"Trying with: {url}")
@@ -541,7 +453,8 @@ async def main_async_with_args(args):
     selector_type = args.selector_type if args.selector_type is not None else config.get('selector_type', 'css')
     baseurl = config.get('baseurl')  # Get baseurl from config if exists
     selectors = config.get('selectors')  # Get selectors array from config if exists
-    
+    title = config.get('title', "")
+    print(f"title = {title}")
     # If command line specifies a selector, use simple mode (ignore selectors array)
     if args.selector is not None:
         selectors = None
@@ -567,7 +480,7 @@ async def main_async_with_args(args):
             output_path.parent.mkdir(parents=True, exist_ok=True)
             # Start with empty file
             with open(args.output_file, 'w', encoding='utf-8') as f:
-                f.write("")
+                f.write(f"\n{title}\n\n")
             
             for i, url in enumerate(urls, 1):
                 # Print progress in format [i/total]
