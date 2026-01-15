@@ -114,7 +114,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                     return {"content": "", "timeout_occurred": navigation_timeout_occurred, "url": url}
                 
                 # Join all extracted texts with separators
-                separator = "\n" + "="*80 + "\n"
+                separator = "\n"
                 content = separator.join(extracted_texts)
                 logger.info(f"Successfully extracted text from {len(extracted_texts)} containers")
                 
@@ -122,6 +122,167 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
                 # Get the complete HTML content
                 content = await page.content()
                 logger.info(f"Successfully fetched full HTML content from {url}")
+            
+            return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
+            
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+            raise
+        finally:
+            await browser.close()
+
+
+async def fetch_page_content_with_selectors(url: str, timeout: int = 30000, selectors: list = None) -> dict:
+    """
+    Fetch web page content using Playwright with complex selector configuration.
+    
+    Args:
+        url: The URL to fetch
+        timeout: Maximum navigation timeout in milliseconds
+        selectors: List of selector configurations
+        
+    Returns:
+        A dictionary containing:
+        - 'content': The extracted text content
+        - 'timeout_occurred': Boolean indicating if a timeout occurred during navigation
+        - 'url': The URL that was fetched
+    """
+    async with async_playwright() as p:
+        # Launch browser (Chromium by default)
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = await context.new_page()
+        
+        navigation_timeout_occurred = False
+        
+        try:
+            logger.info(f"Navigating to {url}")
+            try:
+                await page.goto(url, wait_until='networkidle', timeout=timeout)
+            except TimeoutError as e:
+                logger.warning(f"Navigation timeout occurred: {e}")
+                logger.info("Stopping page loading and continuing with already loaded content...")
+                navigation_timeout_occurred = True
+                # Stop page loading
+                await page.evaluate("window.stop()")
+            
+            # Wait for any dynamic content to load (with timeout handling)
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5000)  # Shorter timeout for load state
+            except TimeoutError as e:
+                if not navigation_timeout_occurred:
+                    logger.warning(f"Load state timeout occurred: {e}")
+                    logger.info("Continuing with current page state...")
+            
+            if not selectors:
+                # If no selectors provided, get the complete HTML content
+                content = await page.content()
+                logger.info(f"Successfully fetched full HTML content from {url}")
+                return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
+            
+            # Process each selector configuration
+            all_extracted_texts = []
+            
+            for selector_config in selectors:
+                selector = selector_config.get('selector')
+                selector_type = selector_config.get('selector_type', 'css')
+                separator = selector_config.get('separator', '\n')
+                exclusions = selector_config.get('exclusions', [])
+                nested_selectors = selector_config.get('selectors', [])
+                
+                if not selector:
+                    logger.warning(f"Missing selector in config: {selector_config}")
+                    continue
+                
+                logger.info(f"Extracting text with selector: {selector} (type: {selector_type})")
+                
+                # Find elements based on selector type
+                if selector_type == 'css':
+                    elements = await page.query_selector_all(selector)
+                elif selector_type == 'xpath':
+                    elements = await page.query_selector_all(f'xpath={selector}')
+                else:
+                    logger.warning(f"Unsupported selector type: {selector_type}, skipping")
+                    continue
+                
+                if not elements:
+                    logger.warning(f"No elements found matching selector: {selector}")
+                    continue
+                
+                # Process each element
+                for i, element in enumerate(elements):
+                    try:
+                        # Apply exclusions if specified
+                        if exclusions:
+                            # Create a copy of the element to work with
+                            element_copy = element
+                            # Remove excluded elements
+                            for exclusion in exclusions:
+                                if exclusion.startswith('.'):
+                                    # CSS class exclusion
+                                    excluded_elements = await element_copy.query_selector_all(exclusion)
+                                else:
+                                    # Tag name exclusion
+                                    excluded_elements = await element_copy.query_selector_all(exclusion)
+                                
+                                for excluded in excluded_elements:
+                                    try:
+                                        await excluded.evaluate("node => node.remove()")
+                                    except Exception as e:
+                                        logger.debug(f"Failed to remove excluded element: {e}")
+                        
+                        # If nested selectors are specified, extract from them
+                        if nested_selectors:
+                            nested_texts = []
+                            for nested_config in nested_selectors:
+                                nested_selector = nested_config.get('selector')
+                                nested_selector_type = nested_config.get('selector_type', 'css')
+                                nested_separator = nested_config.get('separator', '\n')
+                                
+                                if not nested_selector:
+                                    continue
+                                
+                                # Find nested elements
+                                if nested_selector_type == 'css':
+                                    nested_elements = await element.query_selector_all(nested_selector)
+                                elif nested_selector_type == 'xpath':
+                                    nested_elements = await element.query_selector_all(f'xpath={nested_selector}')
+                                else:
+                                    continue
+                                
+                                # Extract text from nested elements
+                                for nested_element in nested_elements:
+                                    try:
+                                        text = await nested_element.text_content()
+                                        if text and text.strip():
+                                            nested_texts.append(text.strip())
+                                    except Exception as e:
+                                        logger.debug(f"Failed to extract text from nested element: {e}")
+                            
+                            if nested_texts:
+                                # Join nested texts with their separator
+                                # nested_content = nested_separator.join(nested_texts)
+                                nested_content = nested_separator.join(nested_texts)
+                                all_extracted_texts.append(nested_content)
+                        else:
+                            # Extract text directly from the element
+                            text = await element.text_content()
+                            if text and text.strip():
+                                all_extracted_texts.append(text.strip())
+                                
+                    except Exception as e:
+                        logger.warning(f"Failed to process element {i+1}: {e}")
+            
+            if not all_extracted_texts:
+                logger.warning("No text content extracted from any selectors")
+                return {"content": "", "timeout_occurred": navigation_timeout_occurred, "url": url}
+            
+            # Join all extracted texts with default separator
+            content = "\n".join(all_extracted_texts)
+            logger.info(f"Successfully extracted text using {len(selectors)} selector configurations")
             
             return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
             
@@ -163,7 +324,7 @@ def load_config(config_path):
         config_path: Path to the JSON configuration file
         
     Returns:
-        dict: Configuration dictionary with keys: timeout, selector, selector_type, baseurl
+        dict: Configuration dictionary with keys: timeout, selector, selector_type, baseurl, selectors
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -178,6 +339,7 @@ def load_config(config_path):
             except (ValueError, TypeError):
                 logger.warning(f"Invalid timeout value in config: {config['timeout']}, using default")
         
+        # Support both simple selector and complex selectors array
         if 'selector' in config:
             valid_config['selector'] = str(config['selector'])
         
@@ -187,6 +349,14 @@ def load_config(config_path):
                 valid_config['selector_type'] = selector_type
             else:
                 logger.warning(f"Invalid selector_type in config: {config['selector_type']}, using default")
+        
+        if 'selectors' in config:
+            # Validate selectors array
+            if isinstance(config['selectors'], list):
+                valid_config['selectors'] = config['selectors']
+                logger.debug(f"Loaded {len(config['selectors'])} selectors from config")
+            else:
+                logger.warning(f"Invalid selectors format in config, expected array")
         
         if 'baseurl' in config:
             baseurl = str(config['baseurl']).strip()
@@ -229,7 +399,7 @@ def load_url_list(list_file):
             # Skip comments
             if line.startswith('#'):
                 continue
-            
+
             # Check if line contains an <a href> tag
             if '<a href=' in line.lower() or '<a href =' in line.lower():
                 # Try to extract URL from href attribute
@@ -285,16 +455,17 @@ def format_content_with_timeout_markers(result):
     return formatted_content
 
 
-async def process_single_url(url, timeout, selector, selector_type, baseurl=None):
+async def process_single_url(url, timeout, selector=None, selector_type='css', baseurl=None, selectors=None):
     """
     Process a single URL and return its content.
     
     Args:
         url: URL to process
         timeout: Navigation timeout in milliseconds
-        selector: CSS selector or XPath for text extraction
-        selector_type: Type of selector
+        selector: CSS selector or XPath for text extraction (simple mode)
+        selector_type: Type of selector (simple mode)
         baseurl: Base URL to prepend to relative URLs (optional)
+        selectors: List of selector configurations (complex mode)
         
     Returns:
         dict: Dictionary containing content, timeout status and URL, or None if failed
@@ -319,12 +490,20 @@ async def process_single_url(url, timeout, selector, selector_type, baseurl=None
         logger.info(f"Trying with: {url}")
     
     try:
-        result = await fetch_page_content(
-            url, 
-            timeout, 
-            selector=selector,
-            selector_type=selector_type
-        )
+        # Use complex selectors if available, otherwise use simple selector
+        if selectors:
+            result = await fetch_page_content_with_selectors(
+                url, 
+                timeout, 
+                selectors=selectors
+            )
+        else:
+            result = await fetch_page_content(
+                url, 
+                timeout, 
+                selector=selector,
+                selector_type=selector_type
+            )
         return result
     except Exception as e:
         logger.error(f"Failed to process {url}: {e}")
@@ -361,8 +540,14 @@ async def main_async_with_args(args):
     selector = args.selector if args.selector is not None else config.get('selector')
     selector_type = args.selector_type if args.selector_type is not None else config.get('selector_type', 'css')
     baseurl = config.get('baseurl')  # Get baseurl from config if exists
+    selectors = config.get('selectors')  # Get selectors array from config if exists
     
-    logger.debug(f"Final parameters - timeout: {timeout}, selector: {selector}, selector_type: {selector_type}, baseurl: {baseurl}")
+    # If command line specifies a selector, use simple mode (ignore selectors array)
+    if args.selector is not None:
+        selectors = None
+        logger.debug("Command line selector specified, using simple mode (ignoring selectors array if present)")
+    
+    logger.debug(f"Final parameters - timeout: {timeout}, selector: {selector}, selector_type: {selector_type}, baseurl: {baseurl}, selectors: {selectors}")
     
     # Process based on whether we have a list file or single URL
     if args.list_file:
@@ -389,7 +574,7 @@ async def main_async_with_args(args):
                 print(f"[{i}/{len(urls)}] Processing: {url}")
                 logger.info(f"Processing URL {i}/{len(urls)}: {url}")
                 
-                result = await process_single_url(url, timeout, selector, selector_type, baseurl)
+                result = await process_single_url(url, timeout, selector, selector_type, baseurl, selectors)
                 
                 if result is not None:
                     successful_urls += 1
@@ -432,7 +617,7 @@ async def main_async_with_args(args):
         print(f"args.url: {args.url}")
         
         try:
-            result = await process_single_url(args.url, timeout, selector, selector_type, baseurl)
+            result = await process_single_url(args.url, timeout, selector, selector_type, baseurl, selectors)
             
             if result is None:
                 logger.error(f"Failed to process {args.url}")
