@@ -339,6 +339,75 @@ def load_url_list(list_file):
         raise
 
 
+def get_first_line_of_list_file(list_file):
+    """
+    Get the first non-empty line of a list file.
+    
+    Args:
+        list_file: Path to the list file
+        
+    Returns:
+        str: The first non-empty line, or empty string if file is empty
+    """
+    try:
+        with open(list_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:  # First non-empty line
+                    return line
+        return ""  # File is empty or contains only empty lines
+    except Exception as e:
+        logger.error(f"Error reading list file {list_file}: {e}")
+        return ""
+
+
+def generate_output_filename(config, list_file=None):
+    """
+    Generate output filename based on the rules:
+    1. If config has 'title' and it's not empty, use title + ".txt"
+    2. Otherwise, if list_file is provided:
+       a. Read first line of list file
+       b. If first line starts with '#', use the line without '#' and spaces
+       c. Otherwise, use list file name + ".txt"
+    3. If no list_file, use default name "output.txt"
+    
+    Args:
+        config: Configuration dictionary
+        list_file: Path to list file (optional)
+        
+    Returns:
+        str: Generated output filename
+    """
+    # Rule 1: Use title from config if available and not empty
+    title = config.get('title', '')
+    if title and title.strip():
+        # Clean title: remove invalid filename characters
+        import re
+        clean_title = re.sub(r'[<>:"/\\|?*]', '', title.strip())
+        return f"{clean_title}.txt"
+    
+    # Rule 2: If list_file is provided
+    if list_file:
+        first_line = get_first_line_of_list_file(list_file)
+        
+        # Rule 2a: If first line starts with '#'
+        if first_line.startswith('#'):
+            # Remove '#' and any leading/trailing spaces
+            filename = first_line[1:].strip()
+            if filename:
+                # Clean filename
+                import re
+                clean_filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+                return f"{clean_filename}.txt"
+        
+        # Rule 2b: Use list file name + ".txt"
+        list_path = Path(list_file)
+        return f"{list_path.stem}.txt"
+    
+    # Rule 3: Default fallback
+    return "output.txt"
+
+
 def format_content_with_timeout_markers(result):
     """
     Format content with timeout markers if timeout occurred.
@@ -446,6 +515,12 @@ async def main_async_with_args(args):
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")
             sys.exit(1)
+    
+    # Generate output filename if not specified
+    if args.output_file is None:
+        args.output_file = generate_output_filename(config, args.list_file)
+        logger.info(f"Generated output filename: {args.output_file}")
+        print(f"Output filename not specified, using generated name: {args.output_file}")
     
     # Determine final parameter values (command line overrides config)
     timeout = args.timeout if args.timeout is not None else config.get('timeout', 30000)
@@ -578,7 +653,8 @@ Examples:
     
     parser.add_argument(
         'output_file',
-        help='Path to the output file where content will be saved'
+        nargs='?',  # Make output_file optional
+        help='Path to the output file where content will be saved. If not specified, filename will be generated based on config title or list file.'
     )
     
     parser.add_argument(
