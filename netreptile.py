@@ -22,6 +22,7 @@ URL List Examples:
 
 import asyncio
 import sys
+from datetime import datetime
 import argparse
 import json
 from pathlib import Path
@@ -68,7 +69,8 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
             logger.info(f"Navigating to {url}")
             try:
                 await page.goto(url, wait_until='networkidle', timeout=timeout)
-            except TimeoutError as e:
+            except Exception as e:
+                print(f"Error Type: [{e.__class__.__name__}]")
                 logger.warning(f"Navigation timeout occurred: {e}")
                 logger.info("Stopping page loading and continuing with already loaded content...")
                 navigation_timeout_occurred = True
@@ -127,6 +129,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
             return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
             
         except Exception as e:
+            logger.error(f"Error Type: [{e.__class__.__name__}]")
             logger.error(f"Error fetching {url}: {e}")
             raise
         finally:
@@ -164,6 +167,7 @@ async def fetch_page_content_with_selectors(url: str, timeout: int = 30000, sele
             try:
                 await page.goto(url, wait_until='networkidle', timeout=timeout)
             except TimeoutError as e:
+                print(f"Error Type: [{e.__class__.__name__}]")
                 logger.warning(f"Navigation timeout occurred: {e}")
                 logger.info("Stopping page loading and continuing with already loaded content...")
                 navigation_timeout_occurred = True
@@ -181,6 +185,8 @@ async def fetch_page_content_with_selectors(url: str, timeout: int = 30000, sele
             if not selectors:
                 # If no selectors provided, get the complete HTML content
                 content = await page.content()
+                if navigation_timeout_occurred:
+                    print(f"content:{content}")
                 logger.info(f"Successfully fetched full HTML content from {url}")
                 return {"content": content, "timeout_occurred": navigation_timeout_occurred, "url": url}
             
@@ -549,6 +555,10 @@ async def main_async_with_args(args):
             logger.info(f"Processing {len(urls)} URLs from {args.list_file}")
             
             successful_urls = 0
+            warning_urls = 0
+            warning_urls_list = []
+            error_urls = 0
+            error_urls_list = []
             
             # Create or truncate output file at the beginning
             output_path = Path(args.output_file)
@@ -565,7 +575,12 @@ async def main_async_with_args(args):
                 result = await process_single_url(url, timeout, selector, selector_type, baseurl, selectors)
                 
                 if result is not None:
-                    successful_urls += 1
+                    timeout_occurred = result.get('timeout_occurred', False)
+                    if timeout_occurred:
+                        warning_urls += 1
+                        warning_urls_list.append({"index":i,"url":url})
+                    else:
+                        successful_urls += 1
                     
                     # Format content with timeout markers if needed
                     formatted_content = format_content_with_timeout_markers(result)
@@ -585,19 +600,46 @@ async def main_async_with_args(args):
                     # Log timeout status if occurred
                     if result.get('timeout_occurred', False):
                         logger.warning(f"Timeout occurred while processing {url} - content marked with timeout indicators")
-                        print(f"[{i}/{len(urls)}] Timeout occurred - content saved with timeout markers: {url}")
+                        print(f"[{i}/{len(urls)}] Timeout occurred - content saved with timeout markers: {url}\n")
                     else:
-                        print(f"[{i}/{len(urls)}] Successfully processed and saved: {url}")
-            
-            if successful_urls == 0:
-                logger.error("Failed to process any URLs from the list")
-                sys.exit(1)
+                        print(f"[{i}/{len(urls)}] Successfully processed and saved: {url}\n")
+                else:
+                    error_urls += 1
+                    error_urls_list.append({"index":i,"url":url})
             
             logger.info(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to {args.output_file}")
             print(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to: {args.output_file}")
             
+            logger.warning(f"{warning_urls} URLs timed out: {warning_urls_list}")
+            
+            if successful_urls == 0:
+                logger.error("Failed to process any URLs from the list")
+                sys.exit(1)
+
         except Exception as e:
             logger.error(f"Failed to process URL list: {e}")
+        finally:
+            with open("warning_error_url.log", 'a', encoding='utf-8') as logf:
+                logf.write(f"\n\nDateTIme: {datetime.now()}\n")
+                logf.write(f"\t--config: {args.config}\n")
+                logf.write(f"\t--list: {args.list_file}\n")
+                logf.write(f"\toutput: {output_path}\n")
+                logf.write(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to: {args.output_file}\n")
+                max_line = max(len(urls)/10,20)
+                if warning_urls >0:
+                    logf.write(f"Warning: {warning_urls} URLs\n")
+                    for url in warning_urls_list[:max_line]:
+                        logf.write(f"{url.get("index",0)}\t{url.get("url")}\n")
+                    if warning_urls > max_line:
+                        logf.write(f"...\n")
+
+                if error_urls >0:
+                    logf.write(f"Error: {error_urls} URLs\n")
+                    for url in error_urls_list[:max_line]:
+                        logf.write(f"{url.get("index",0)}\t{url.get("url")}\n")
+                    if warning_urls > max_line:
+                        logf.write(f"...\n")
+                logf.close()
             sys.exit(1)
     
     else:
