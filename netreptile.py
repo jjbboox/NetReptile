@@ -606,14 +606,14 @@ async def main_async_with_args(args):
                         # Log timeout status if occurred
                         if result.get('timeout_occurred', False):
                             logger.warning(f"Timeout occurred while processing {url} - content marked with timeout indicators")
-                            print(f"[{i}/{len(urls)}][W/E][{warning_urls}/{error_urls}] Timeout occurred - content saved with timeout markers: {url}\n")
+                            print(f"[{i}/{len(urls)}][W/E:{warning_urls}/{error_urls}] Timeout occurred - content saved with timeout markers: {url}\n")
                         else:
-                            print(f"[{i}/{len(urls)}][W/E][{warning_urls}/{error_urls}] Successfully processed and saved: {url}\n")
+                            print(f"[{i}/{len(urls)}][W/E:{warning_urls}/{error_urls}] Successfully processed and saved: {url}\n")
                     else:
                         error_urls += 1
                         error_urls_list.append({"index":i,"uuid":uuid4, "url":url})
                         f.write(f"\n\n{'='*80}\nERROR - Failed to process URL: {url}\n{'='*80}\n")
-                        print(f"[{i}/{len(urls)}][W/E][{warning_urls}/{error_urls}] Error processing URL: {url}\n")
+                        print(f"[{i}/{len(urls)}][W/E:{warning_urls}/{error_urls}] Error processing URL: {url}\n")
                 time.sleep(1.0)  # Small delay to avoid overwhelming the server
             
             logger.info(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to {args.output_file}")
