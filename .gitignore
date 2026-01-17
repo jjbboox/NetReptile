@@ -170,6 +170,7 @@ Thumbs.db
 Desktop.ini
 
 # User
+url_list/
 temp/
 output/
 logs/
