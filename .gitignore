@@ -171,3 +171,6 @@ Desktop.ini
 
 # User
 temp/
+output/
+logs/
+*.log
