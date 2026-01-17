@@ -22,10 +22,12 @@ URL List Examples:
 
 import asyncio
 import sys
+import time
 from datetime import datetime
 import argparse
 import json
 from pathlib import Path
+import uuid
 from playwright.async_api import async_playwright
 import logging
 from selector_processor import process_selectors
@@ -133,6 +135,7 @@ async def fetch_page_content(url: str, timeout: int = 30000, selector: str = Non
             logger.error(f"Error fetching {url}: {e}")
             raise
         finally:
+            await page.close()
             await browser.close()
 
 
@@ -366,6 +369,26 @@ def get_first_line_of_list_file(list_file):
         logger.error(f"Error reading list file {list_file}: {e}")
         return ""
 
+def get_title(config, list_file=None):
+    # Rule 1: Use title from config if available and not empty
+    title = config.get('title', '')
+    if title and title.strip():
+        # Clean title: remove invalid filename characters
+        import re
+        clean_title = re.sub(r'[<>:"/\\|?*]', '', title.strip())
+        return clean_title
+    
+    # Rule 2: If list_file is provided
+    if list_file:
+        first_line = get_first_line_of_list_file(list_file)
+        
+        # Rule 2a: If first line starts with '#'
+        if first_line.startswith('#'):
+            import re
+            # Remove '#' and any leading/trailing spaces
+            return re.sub(r'[<>:"/\\|?*]', '', first_line[1:].strip())
+        else:
+            return None
 
 def generate_output_filename(config, list_file=None):
     """
@@ -384,35 +407,14 @@ def generate_output_filename(config, list_file=None):
     Returns:
         str: Generated output filename
     """
-    # Rule 1: Use title from config if available and not empty
-    title = config.get('title', '')
-    if title and title.strip():
-        # Clean title: remove invalid filename characters
-        import re
-        clean_title = re.sub(r'[<>:"/\\|?*]', '', title.strip())
-        return f"{clean_title}.txt"
-    
-    # Rule 2: If list_file is provided
-    if list_file:
-        first_line = get_first_line_of_list_file(list_file)
-        
-        # Rule 2a: If first line starts with '#'
-        if first_line.startswith('#'):
-            # Remove '#' and any leading/trailing spaces
-            filename = first_line[1:].strip()
-            if filename:
-                # Clean filename
-                import re
-                clean_filename = re.sub(r'[<>:"/\\|?*]', '', filename)
-                return f"{clean_filename}.txt"
-        
-        # Rule 2b: Use list file name + ".txt"
+    title = get_title(config, list_file)
+    if title:
+        return f"{title}.txt"
+    elif list_file:
         list_path = Path(list_file)
         return f"{list_path.stem}.txt"
-    
-    # Rule 3: Default fallback
-    return "output.txt"
-
+    else:
+        return "output.txt"
 
 def format_content_with_timeout_markers(result):
     """
@@ -534,7 +536,7 @@ async def main_async_with_args(args):
     selector_type = args.selector_type if args.selector_type is not None else config.get('selector_type', 'css')
     baseurl = config.get('baseurl')  # Get baseurl from config if exists
     selectors = config.get('selectors')  # Get selectors array from config if exists
-    title = config.get('title', "")
+    title = get_title(config, args.list_file)
     print(f"title = {title}")
     # If command line specifies a selector, use simple mode (ignore selectors array)
     if args.selector is not None:
@@ -572,45 +574,53 @@ async def main_async_with_args(args):
                 print(f"[{i}/{len(urls)}] Processing: {url}")
                 logger.info(f"Processing URL {i}/{len(urls)}: {url}")
                 
+                uuid4 = uuid.uuid4()
+                print(f"UUID4: {uuid4}")
+
                 result = await process_single_url(url, timeout, selector, selector_type, baseurl, selectors)
                 
-                if result is not None:
-                    timeout_occurred = result.get('timeout_occurred', False)
-                    if timeout_occurred:
-                        warning_urls += 1
-                        warning_urls_list.append({"index":i,"url":url})
-                    else:
-                        successful_urls += 1
-                    
-                    # Format content with timeout markers if needed
-                    formatted_content = format_content_with_timeout_markers(result)
-                    
-                    # Add URL header and separator
-                    url_header = "\n"*4
-                    
-                    # Append content to output file immediately
-                    with open(args.output_file, 'a', encoding='utf-8') as f:
+                with open(args.output_file, 'a', encoding='utf-8') as f:
+                    if result is not None:
+                        timeout_occurred = result.get('timeout_occurred', False)
+                        if timeout_occurred:
+                            warning_urls += 1
+                            warning_urls_list.append({"index":i, "uuid":uuid4, "url":url})
+                        else:
+                            successful_urls += 1
+                        
+                        # Format content with timeout markers if needed
+                        formatted_content = format_content_with_timeout_markers(result)
+                        
+                        # Add URL header and separator
+                        url_header = "\n"*4
+                        
+                        # Append content to output file immediately
+                        
                         if i > 1:  # Add separator before content if not first URL
                             f.write(url_header)
                         else:  # First URL, just write header without leading newline
                             f.write(url_header.lstrip())
                         
                         f.write(formatted_content)
-                    
-                    # Log timeout status if occurred
-                    if result.get('timeout_occurred', False):
-                        logger.warning(f"Timeout occurred while processing {url} - content marked with timeout indicators")
-                        print(f"[{i}/{len(urls)}] Timeout occurred - content saved with timeout markers: {url}\n")
+                        
+                        # Log timeout status if occurred
+                        if result.get('timeout_occurred', False):
+                            logger.warning(f"Timeout occurred while processing {url} - content marked with timeout indicators")
+                            print(f"[{i}/{len(urls)}][W/E][{warning_urls}/{error_urls}] Timeout occurred - content saved with timeout markers: {url}\n")
+                        else:
+                            print(f"[{i}/{len(urls)}][W/E][{warning_urls}/{error_urls}] Successfully processed and saved: {url}\n")
                     else:
-                        print(f"[{i}/{len(urls)}] Successfully processed and saved: {url}\n")
-                else:
-                    error_urls += 1
-                    error_urls_list.append({"index":i,"url":url})
+                        error_urls += 1
+                        error_urls_list.append({"index":i,"uuid":uuid4, "url":url})
+                        f.write(f"\n\n{'='*80}\nERROR - Failed to process URL: {url}\n{'='*80}\n")
+                        print(f"[{i}/{len(urls)}][W/E][{warning_urls}/{error_urls}] Error processing URL: {url}\n")
+                time.sleep(1.0)  # Small delay to avoid overwhelming the server
             
             logger.info(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to {args.output_file}")
             print(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to: {args.output_file}")
             
-            logger.warning(f"{warning_urls} URLs timed out: {warning_urls_list}")
+            if warning_urls > 0 or error_urls > 0:
+                logger.warning(f"Warnings/Errors({warning_urls}/{error_urls}) occurred during processing. See 'warning_error_url.log' for details.")
             
             if successful_urls == 0:
                 logger.error("Failed to process any URLs from the list")
@@ -625,19 +635,19 @@ async def main_async_with_args(args):
                 logf.write(f"\t--list: {args.list_file}\n")
                 logf.write(f"\toutput: {output_path}\n")
                 logf.write(f"Successfully processed {successful_urls}/{len(urls)} URLs and saved to: {args.output_file}\n")
-                max_line = max(len(urls)/10,20)
+                max_line = max(len(urls)/10,50)
                 if warning_urls >0:
                     logf.write(f"Warning: {warning_urls} URLs\n")
                     for url in warning_urls_list[:max_line]:
-                        logf.write(f"{url.get("index",0)}\t{url.get("url")}\n")
+                        logf.write(f'{url["index"]}\t{url["uuid"]}\t{url["url"]}\n')
                     if warning_urls > max_line:
                         logf.write(f"...\n")
 
                 if error_urls >0:
                     logf.write(f"Error: {error_urls} URLs\n")
                     for url in error_urls_list[:max_line]:
-                        logf.write(f"{url.get("index",0)}\t{url.get("url")}\n")
-                    if warning_urls > max_line:
+                        logf.write(f'{url["index"]}\t{url["uuid"]}\t{url["url"]}\n')
+                    if error_urls > max_line:
                         logf.write(f"...\n")
                 logf.close()
             sys.exit(1)
@@ -738,6 +748,16 @@ Examples:
     # Parse arguments
     args = parser.parse_args()
     
+    # Fix argument parsing issue when using --list option
+    # When using --list <list_file> <output_file>, argparse incorrectly assigns
+    # output_file to url parameter because url is the first positional argument.
+    # We need to fix this by moving args.url to args.output_file when appropriate.
+    if args.list_file and args.output_file is None and args.url is not None:
+        # args.url likely contains the output_file value
+        args.output_file = args.url
+        args.url = None
+        logger.debug(f"Fixed argument parsing: moved '{args.output_file}' from url to output_file")
+
     # Handle Windows-specific asyncio issues
     if sys.platform == 'win32':
         # Try to use ProactorEventLoop for better Windows compatibility

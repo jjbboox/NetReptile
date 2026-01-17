@@ -9,7 +9,7 @@
         {
             "selector": "//div[@id='content']",
             "selector_type": "xpath",
-            "exclusions": ["font", ".footer"],
+            "exclusions": ["font", "br", ".footer"],
             "selectors": [
                 {
                     "selector": "p", 
