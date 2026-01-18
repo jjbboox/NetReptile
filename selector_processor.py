@@ -29,6 +29,7 @@ async def process_selector_config(page, selector_config: Dict[str, Any], parent_
     exclusions = selector_config.get('Exclusions', [])
     exclusions = selector_config.get('exclusions', exclusions)  # Support both capital and lowercase
     nested_selectors = selector_config.get('selectors', [])
+    replace_rules = selector_config.get('replace', [])
     
     if not selector:
         logger.warning(f"Missing selector in config: {selector_config}")
@@ -93,12 +94,35 @@ async def process_selector_config(page, selector_config: Dict[str, Any], parent_
                     all_extracted_texts.append(nested_content)
             else:
                 # Extract text directly from the element
-                text = await element.text_content()
+                # Use inner_text() instead of text_content() to preserve line breaks from <br> tags
+                text = await element.inner_text()
                 if text and text.strip():
                     all_extracted_texts.append(text.strip())
                     
         except Exception as e:
             logger.warning(f"Failed to process element {i+1}: {e}")
+    
+    # Apply replace rules if specified
+    if replace_rules and all_extracted_texts:
+        logger.debug(f"Applying {len(replace_rules)} replace rules")
+        for i, text in enumerate(all_extracted_texts):
+            for replace_rule in replace_rules:
+                target_tag = replace_rule.get('target_tag')
+                replace_str = replace_rule.get('replace_str')
+                
+                if target_tag and replace_str is not None:
+                    # Create regex pattern to match HTML tags
+                    # This will match both opening and closing tags
+                    # Also handle self-closing tags like <br/>
+                    pattern = rf'<{target_tag}[^>]*/?>|</{target_tag}>'
+                    import re
+                    # Replace all occurrences of the tag with replace_str
+                    new_text = re.sub(pattern, replace_str, text)
+                    if new_text != text:
+                        logger.debug(f"Replaced {target_tag} tags with '{replace_str}' in text {i+1}")
+                        text = new_text
+            
+            all_extracted_texts[i] = text
     
     return all_extracted_texts
 

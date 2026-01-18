@@ -16,12 +16,11 @@
         {
             "selector": "pre",
             "selector_type": "css",
-            "exclusions": ["font", "br", "a"],
-            "selectors": [
+            "exclusions": ["font", "a"],
+            "replace": [
                 {
-                    "selector": "p",
-                    "selector_type": "css",
-                    "separator": "\n"
+                    "target_tag": "br",
+                    "replace_str": "\n"
                 }
             ]
         }
