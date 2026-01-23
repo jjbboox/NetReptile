@@ -162,10 +162,69 @@ python netreptile.py https://example.com output.html --config config.json --sele
 6. Combines extracted text with separators
 7. Saves the extracted text to the specified output file
 
+## HTML Tag Parser
+
+The project now includes an additional tool `html_tag_parser.py` for extracting specific HTML tags from text files.
+
+### Features
+
+- Extract specific HTML tags (e.g., `<a>`, `<div>`, `<p>`, `<img>`) from text/HTML files
+- Multiple extraction modes:
+  - Extract complete HTML tags
+  - Extract only text content (without tags)
+  - Extract specific attributes (e.g., `href` from `<a>` tags, `src` from `<img>` tags)
+- Support for both BeautifulSoup (accurate) and regex (fast) parsing methods
+- Customizable output separator
+- UTF-8 encoding support with fallback
+
+### Usage
+
+```bash
+python html_tag_parser.py <input_file> <tag_name> <output_file> [options]
+```
+
+### Examples
+
+```bash
+# Extract all <a> tags from input.html and save to links.txt
+python html_tag_parser.py input.html a links.txt
+
+# Extract href attributes from all <a> tags
+python html_tag_parser.py input.html a links.txt --attr href
+
+# Extract only text content from <p> tags
+python html_tag_parser.py input.txt p paragraphs.txt --text-only
+
+# Extract <img> tags with src attributes
+python html_tag_parser.py input.html img images.txt --attr src
+
+# Extract complete <div> tags
+python html_tag_parser.py input.html div output.txt --include-tag
+
+# Use regex-based extraction (faster but less accurate)
+python html_tag_parser.py input.html a output.txt --regex
+
+# Use custom separator between extracted items
+python html_tag_parser.py input.html span output.txt --separator " | "
+```
+
+### Command Line Arguments
+
+- `input_file`: Path to the input file containing HTML/text content (required)
+- `tag_name`: HTML tag name to extract (e.g., a, div, p, span, img) (required)
+- `output_file`: Path to the output file where extracted content will be saved (required)
+- `--attr`: Extract specific attribute instead of tag content (e.g., href, src, class)
+- `--text-only`: Extract only text content (without HTML tags)
+- `--include-tag`: Include the complete HTML tag in output
+- `--regex`: Use regex-based extraction instead of BeautifulSoup (faster but less accurate)
+- `--separator`: Separator between extracted items in output file (default: newline)
+- `--verbose`: Enable verbose logging
+
 ## Requirements
 
 - Python 3.7 or higher
 - Playwright library
+- BeautifulSoup4 library (for html_tag_parser.py)
 - Chromium browser (automatically installed by Playwright)
 
 ## License
@@ -271,10 +330,69 @@ python netreptile.py https://magazine.example.com articles.txt --selector ".arti
 6. 使用分隔符组合提取的文本
 7. 将提取的文本保存到指定的输出文件
 
+## HTML 标签解析器
+
+项目现在包含一个额外的工具 `html_tag_parser.py`，用于从文本文件中提取特定的 HTML 标签。
+
+### 功能特点
+
+- 从文本/HTML 文件中提取特定的 HTML 标签（例如 `<a>`、`<div>`、`<p>`、`<img>`）
+- 多种提取模式：
+  - 提取完整的 HTML 标签
+  - 仅提取文本内容（不含标签）
+  - 提取特定属性（例如从 `<a>` 标签提取 `href`，从 `<img>` 标签提取 `src`）
+- 支持 BeautifulSoup（准确）和正则表达式（快速）两种解析方法
+- 可自定义的输出分隔符
+- 支持 UTF-8 编码，并提供回退机制
+
+### 使用方法
+
+```bash
+python html_tag_parser.py <输入文件> <标签名> <输出文件> [选项]
+```
+
+### 示例
+
+```bash
+# 从 input.html 中提取所有 <a> 标签并保存到 links.txt
+python html_tag_parser.py input.html a links.txt
+
+# 从所有 <a> 标签中提取 href 属性
+python html_tag_parser.py input.html a links.txt --attr href
+
+# 仅从 <p> 标签中提取文本内容
+python html_tag_parser.py input.txt p paragraphs.txt --text-only
+
+# 提取带有 src 属性的 <img> 标签
+python html_tag_parser.py input.html img images.txt --attr src
+
+# 提取完整的 <div> 标签
+python html_tag_parser.py input.html div output.txt --include-tag
+
+# 使用基于正则表达式的提取（更快但准确性较低）
+python html_tag_parser.py input.html a output.txt --regex
+
+# 使用自定义分隔符分隔提取的项目
+python html_tag_parser.py input.html span output.txt --separator " | "
+```
+
+### 命令行参数
+
+- `input_file`: 包含 HTML/文本内容的输入文件路径（必需）
+- `tag_name`: 要提取的 HTML 标签名称（例如 a、div、p、span、img）（必需）
+- `output_file`: 保存提取内容的输出文件路径（必需）
+- `--attr`: 提取特定属性而不是标签内容（例如 href、src、class）
+- `--text-only`: 仅提取文本内容（不含 HTML 标签）
+- `--include-tag`: 在输出中包含完整的 HTML 标签
+- `--regex`: 使用基于正则表达式的提取而不是 BeautifulSoup（更快但准确性较低）
+- `--separator`: 输出文件中提取项目之间的分隔符（默认：换行符）
+- `--verbose`: 启用详细日志记录
+
 ## 系统要求
 
 - Python 3.7 或更高版本
 - Playwright 库
+- BeautifulSoup4 库（用于 html_tag_parser.py）
 - Chromium 浏览器（由 Playwright 自动安装）
 
 ## 许可证
