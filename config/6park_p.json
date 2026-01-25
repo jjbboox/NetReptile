@@ -19,11 +19,11 @@
             "exclusions": ["font", "a"],
             "replace": [
                 {
-                    "target_tag": "br",
+                    "target_tag": "p",
                     "replace_str": "\n"
                 }
             ]
         }
     ],
-    "baseurl": ""
+    "baseurl": "https://www.cool18.com/bbs4/"
 }
