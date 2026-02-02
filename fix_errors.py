@@ -172,7 +172,8 @@ async def process_file(input_file: str, config_file: Optional[str] = None, outpu
     fixed_content = content
     # 需要跟踪偏移量，因为替换会改变字符串长度
     offset = 0
-    
+    fix_success_count = 0
+    fix_error_count = 0
     for i, (start, end, url) in enumerate(error_blocks, 1):
         logger.info(f"处理错误块 {i}/{len(error_blocks)}: {url}")
         
@@ -199,10 +200,11 @@ async def process_file(input_file: str, config_file: Optional[str] = None, outpu
             old_length = adjusted_end - adjusted_start
             new_length = len(new_content)
             offset += new_length - old_length
-            
-            logger.info(f"成功替换错误块 {i}")
+            fix_success_count += 1
+            logger.info(f"[{i}/{error_blocks}]成功替换错误块 [S/E:{fix_success_count}/{fix_error_count}]")
         else:
-            logger.warning(f"爬取失败，跳过错误块 {i}: {url}")
+            fix_error_count += 1
+            logger.warning(f"[{i}/{error_blocks}]爬取失败，跳过错误块 {fix_error_count}: {url}")
     
     # 确定输出文件路径
     if output_file is None:
