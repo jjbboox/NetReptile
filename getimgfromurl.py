@@ -26,12 +26,13 @@ import argparse
 import sys
 import os
 import re
+import json
 import logging
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import asyncio
 import random
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from playwright.async_api import async_playwright
 import aiofiles
 
@@ -125,6 +126,262 @@ async def create_browser_context(p, url: str, timeout: int = 30000, user_agent: 
         await context.close()
         await browser.close()
         raise
+
+
+def parse_auth_file(filepath: str) -> Dict[str, Any]:
+    """
+    Parse auth.json file which uses JavaScript object syntax.
+    
+    Args:
+        filepath: Path to auth.json file
+        
+    Returns:
+        Dictionary containing authentication configuration
+    """
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Convert JavaScript object syntax to JSON
+        # Add quotes around keys that don't have them
+        lines = content.split('\n')
+        result_lines = []
+        
+        for line in lines:
+            # Skip empty lines
+            if not line.strip():
+                result_lines.append(line)
+                continue
+                
+            # Find keys without quotes
+            in_string = False
+            escaped = False
+            new_line = ''
+            i = 0
+            
+            while i < len(line):
+                char = line[i]
+                
+                if char == '"' and not escaped:
+                    in_string = not in_string
+                    new_line += char
+                elif char == '\\' and not escaped:
+                    escaped = True
+                    new_line += char
+                elif escaped:
+                    escaped = False
+                    new_line += char
+                elif not in_string and (char.isalpha() or char == '_'):
+                    # Start of a key
+                    key_end = i
+                    while key_end < len(line) and (line[key_end].isalnum() or line[key_end] == '_'):
+                        key_end += 1
+                    
+                    if key_end < len(line) and line[key_end] == ':':
+                        key = line[i:key_end]
+                        new_line += f'"{key}":'
+                        i = key_end
+                    else:
+                        new_line += char
+                else:
+                    new_line += char
+                
+                i += 1
+            
+            result_lines.append(new_line)
+        
+        # Join lines and parse as JSON
+        json_content = '\n'.join(result_lines)
+        return json.loads(json_content)
+        
+    except Exception as e:
+        logger.error(f"Error parsing auth file {filepath}: {e}")
+        raise
+
+
+async def perform_login(page, auth_config: Dict[str, Any], timeout: int = 10000) -> bool:
+    """
+    Perform login using authentication configuration.
+    
+    Args:
+        page: Playwright page object
+        auth_config: Authentication configuration dictionary
+        timeout: Maximum wait time for login elements in milliseconds
+        
+    Returns:
+        True if login successful, False otherwise
+    """
+    try:
+        base_url = auth_config.get('base_url')
+        if not base_url:
+            logger.error("No base_url found in auth configuration")
+            return False
+        
+        logger.info(f"Navigating to base URL for login: {base_url}")
+        
+        # Navigate to base URL
+        try:
+            await page.goto(base_url, wait_until='networkidle', timeout=timeout)
+        except Exception as e:
+            logger.warning(f"Navigation timeout occurred: {e}")
+            await page.evaluate("window.stop()")
+        
+        # Wait for page to stabilize
+        try:
+            await page.wait_for_load_state('networkidle', timeout=5000)
+        except Exception:
+            logger.info("Continuing with current page state...")
+        
+        # Get login configuration
+        username_config = auth_config.get('user_name', {})
+        password_config = auth_config.get('password', {})
+        login_button_config = auth_config.get('login_button', {})
+        
+        username_selector = username_config.get('selector')
+        username_value = username_config.get('value')
+        password_selector = password_config.get('selector')
+        password_value = password_config.get('value')
+        login_button_selector = login_button_config.get('selector')
+        
+        # Get wait time from auth config (default to 0 if not specified)
+        wait_time = auth_config.get('wait', 0)
+        
+        if not all([username_selector, username_value, password_selector, password_value, login_button_selector]):
+            logger.error("Incomplete login configuration in auth file")
+            return False
+        
+        logger.info("Waiting for login form elements...")
+        
+        # Wait for username field
+        try:
+            await page.wait_for_selector(username_selector, timeout=timeout)
+            logger.info(f"Found username field: {username_selector}")
+        except Exception as e:
+            logger.error(f"Username field not found: {username_selector} - {e}")
+            return False
+        
+        # Wait for password field
+        try:
+            await page.wait_for_selector(password_selector, timeout=timeout)
+            logger.info(f"Found password field: {password_selector}")
+        except Exception as e:
+            logger.error(f"Password field not found: {password_selector} - {e}")
+            return False
+        
+        # Wait for login button
+        try:
+            await page.wait_for_selector(login_button_selector, timeout=timeout)
+            logger.info(f"Found login button: {login_button_selector}")
+        except Exception as e:
+            logger.error(f"Login button not found: {login_button_selector} - {e}")
+            return False
+        
+        # Fill in username
+        logger.info(f"Filling username: {username_value}")
+        await page.fill(username_selector, username_value)
+        
+        # Fill in password
+        logger.info("Filling password")
+        await page.fill(password_selector, password_value)
+        
+        # Click login button
+        logger.info("Clicking login button")
+        await page.click(login_button_selector)
+        
+        # Wait for specified time after clicking login button
+        if wait_time > 0:
+            logger.info(f"Waiting for {wait_time}ms after login submission...")
+            await asyncio.sleep(wait_time / 1000.0)
+            logger.info(f"Wait completed, continuing with login verification")
+        
+        # Wait for login to complete
+        logger.info("Waiting for login to complete...")
+        try:
+            # Wait for navigation or some indication of successful login
+            await page.wait_for_load_state('networkidle', timeout=timeout)
+            
+            # Check if we're still on the login page (login failed)
+            current_url = page.url
+            if 'login' in current_url.lower() or 'signin' in current_url.lower():
+                logger.warning("Still on login page after login attempt")
+                # Check for error messages
+                error_selectors = ['.error', '.alert-danger', '.login-error', '[class*="error"]']
+                for selector in error_selectors:
+                    error_elements = await page.query_selector_all(selector)
+                    if error_elements:
+                        for error in error_elements[:3]:  # Check first 3 errors
+                            error_text = await error.text_content()
+                            if error_text and len(error_text.strip()) > 0:
+                                logger.error(f"Login error: {error_text.strip()}")
+                                return False
+                
+                return False
+            
+            logger.info("Login appears successful")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error waiting for login completion: {e}")
+            # Even if there's an error, we might still be logged in
+            # Check current URL to see if we're still on login page
+            current_url = page.url
+            if 'login' in current_url.lower() or 'signin' in current_url.lower():
+                logger.error("Still on login page")
+                return False
+            
+            logger.info("Assuming login successful despite timeout")
+            return True
+        
+    except Exception as e:
+        logger.error(f"Error during login: {e}")
+        return False
+
+
+async def is_logged_in(page, check_url: str = None, timeout: int = 5000) -> bool:
+    """
+    Check if the user is logged in.
+    
+    Args:
+        page: Playwright page object
+        check_url: Optional URL to navigate to for checking login status
+        timeout: Maximum wait time in milliseconds
+        
+    Returns:
+        True if logged in, False otherwise
+    """
+    try:
+        if check_url:
+            logger.info(f"Navigating to {check_url} to check login status")
+            await page.goto(check_url, wait_until='networkidle', timeout=timeout)
+        
+        # Check for common logged-in indicators
+        logged_in_indicators = [
+            'logout', 'log out', 'sign out', 'signout',
+            'my account', 'profile', 'dashboard',
+            'welcome,', 'hello,'
+        ]
+        
+        page_content = (await page.content()).lower()
+        
+        for indicator in logged_in_indicators:
+            if indicator in page_content:
+                logger.info(f"Found logged-in indicator: {indicator}")
+                return True
+        
+        # Check for login/signin forms (if present, we're probably not logged in)
+        login_indicators = ['login', 'signin', 'username', 'password', 'log in']
+        for indicator in login_indicators:
+            if indicator in page_content:
+                logger.info(f"Found login indicator: {indicator}")
+                return False
+        
+        # If we can't determine, assume not logged in
+        logger.warning("Could not determine login status")
+        return False
+        
+    except Exception as e:
+        logger.warning(f"Error checking login status: {e}")
+        return False
 
 
 def extract_img_urls_from_pre_tags(html_content: str, base_url: str) -> List[str]:
@@ -598,8 +855,121 @@ async def extract_images_only(page, output_dir: Path, default_ext: str = 'jpg') 
         return {'total': 0, 'success': 0, 'failed': 0}
 
 
+async def process_single_task_with_existing_context(context, url: str, output_dir: str, timeout: int, 
+                                                   ext: str, verbose: bool, auth_config: Dict[str, Any] = None, 
+                                                   login_successful: bool = None) -> dict:
+    """
+    Process a single URL task using an existing browser context (for batch processing).
+    
+    Args:
+        context: Existing Playwright browser context object
+        url: URL to process
+        output_dir: Output directory for images
+        timeout: Navigation timeout in milliseconds
+        ext: Default file extension
+        verbose: Verbose logging flag
+        auth_config: Authentication configuration dictionary (optional)
+        login_successful: Whether login was successful (optional)
+        
+    Returns:
+        Dictionary with task statistics
+    """
+    # Set logging level
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose mode enabled")
+    
+    # Validate URL
+    if not url.startswith(('http://', 'https://')):
+        logger.warning(f"URL doesn't start with http:// or https://: {url}")
+        # Try to add https:// if missing
+        url = f"https://{url}"
+        logger.info(f"Trying with: {url}")
+    
+    # Create output directory path
+    output_dir_path = Path(output_dir)
+    
+    page = None
+    try:
+        # Create a new page for this task
+        page = await context.new_page()
+        
+        # Step 1: Navigate to URL using the new page
+        logger.info(f"Navigating to {url} using new page")
+        
+        try:
+            await page.goto(url, wait_until='networkidle', timeout=timeout)
+        except Exception as e:
+            logger.warning(f"Navigation timeout occurred: {e}")
+            logger.info("Stopping page loading and continuing with already loaded content...")
+            # Stop page loading
+            try:
+                await page.evaluate("window.stop()")
+            except Exception as stop_error:
+                logger.debug(f"Could not stop page loading: {stop_error}")
+        
+        # Wait for any dynamic content to load
+        try:
+            await page.wait_for_load_state('networkidle', timeout=5000)
+        except Exception:
+            logger.info("Continuing with current page state...")
+        
+        # Get the complete HTML content
+        html_content = await page.content()
+        logger.info(f"Successfully fetched HTML content from {url}")
+        
+        # Step 2: Wait for images in <pre> tags to load
+        logger.info("Waiting for images in <pre> tags to load...")
+        images_loaded = await wait_for_pre_images_loaded(page, timeout=timeout)
+        
+        if not images_loaded:
+            logger.warning("Images may not have fully loaded, but will try to save what's available")
+        
+        # Step 3: Extract images only (no page saving)
+        logger.info("Extracting images...")
+        stats = await extract_images_only(
+            page,
+            output_dir_path,
+            default_ext=ext
+        )
+        
+        if stats['total'] == 0:
+            # Fallback: try to extract URLs from HTML
+            logger.warning("No images extracted, falling back to HTML extraction...")
+            img_urls = extract_img_urls_from_pre_tags(html_content, url)
+            
+            if img_urls:
+                logger.info(f"Found {len(img_urls)} image URLs in HTML")
+                print(f"Found {len(img_urls)} image URLs but could not extract them")
+                print("Image URLs found:")
+                for i, url_item in enumerate(img_urls, 1):
+                    print(f"  {i}. {url_item}")
+            else:
+                logger.error("No images found in <pre> tags on the page")
+                print("No images found in <pre> tags on the page")
+            
+            stats['has_fallback_urls'] = bool(img_urls)
+            stats['fallback_urls'] = img_urls
+        
+        # Add URL and output directory to stats
+        stats['url'] = url
+        stats['output_dir'] = str(output_dir_path.absolute())
+        stats['auth_used'] = auth_config is not None
+        stats['login_successful'] = login_successful if auth_config is not None else None
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error processing {url}: {e}")
+        raise
+    finally:
+        # Close the page when done
+        if page:
+            await page.close()
+
+
 async def process_single_task(url: str, output_dir: str, timeout: int, user_agent: str, 
-                             proxy: str, ext: str, verbose: bool) -> dict:
+                             proxy: str, ext: str, verbose: bool, auth_file: str = None) -> dict:
     """
     Process a single URL task.
     
@@ -611,6 +981,7 @@ async def process_single_task(url: str, output_dir: str, timeout: int, user_agen
         proxy: Proxy URL
         ext: Default file extension
         verbose: Verbose logging flag
+        auth_file: Path to authentication configuration file (optional)
         
     Returns:
         Dictionary with task statistics
@@ -649,6 +1020,34 @@ async def process_single_task(url: str, output_dir: str, timeout: int, user_agen
             proxy=proxy
         )
         
+        # Step 1.5: Perform login if auth file is provided
+        auth_config = None
+        if auth_file:
+            print(f"auth:{auth_file}")
+            try:
+                logger.info(f"Loading authentication configuration from {auth_file}")
+                auth_config = parse_auth_file(auth_file)
+                
+                if auth_config:
+                    logger.info("Attempting to log in...")
+                    login_successful = await perform_login(page, auth_config, timeout=timeout)
+                    
+                    if login_successful:
+                        logger.info("Login successful")
+                        # Verify login status
+                        login_verified = await is_logged_in(page, check_url=url, timeout=5000)
+                        if login_verified:
+                            logger.info("Login verified")
+                        else:
+                            logger.warning("Login status could not be verified, but continuing anyway")
+                    else:
+                        logger.warning("Login failed, continuing without authentication")
+                else:
+                    logger.warning("No authentication configuration loaded")
+            except Exception as e:
+                logger.error(f"Error during authentication: {e}")
+                logger.warning("Continuing without authentication")
+        
         # Step 2: Wait for images in <pre> tags to load
         logger.info("Waiting for images in <pre> tags to load...")
         images_loaded = await wait_for_pre_images_loaded(page, timeout=timeout)
@@ -685,6 +1084,8 @@ async def process_single_task(url: str, output_dir: str, timeout: int, user_agen
         # Add URL and output directory to stats
         stats['url'] = url
         stats['output_dir'] = str(output_dir_path.absolute())
+        stats['auth_used'] = auth_config is not None
+        stats['login_successful'] = auth_config is not None and login_successful if auth_config else None
         
         return stats
         
@@ -703,10 +1104,11 @@ async def process_single_task(url: str, output_dir: str, timeout: int, user_agen
             await playwright_instance.stop()
 
 
-async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str, 
-                             proxy: str, ext: str, verbose: bool, parallel: int = 3) -> List[dict]:
+async def process_batch_tasks_fallback(tasks: List[tuple], timeout: int, user_agent: str, 
+                                      proxy: str, ext: str, verbose: bool, parallel: int = 3, auth_file: str = None) -> List[dict]:
     """
-    Process multiple tasks with parallel execution.
+    Fallback implementation for batch processing when shared browser setup fails.
+    Each task creates its own browser instance.
     
     Args:
         tasks: List of tuples (url, output_dir)
@@ -716,6 +1118,7 @@ async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str,
         ext: Default file extension
         verbose: Verbose logging flag
         parallel: Maximum number of parallel tasks (default: 3)
+        auth_file: Path to authentication configuration file (optional)
         
     Returns:
         List of task statistics dictionaries
@@ -723,10 +1126,12 @@ async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str,
     all_stats = []
     
     print("\n" + "="*60)
-    print("BATCH PROCESSING STARTED")
+    print("BATCH PROCESSING FALLBACK MODE")
     print("="*60)
     print(f"Total tasks: {len(tasks)}")
     print(f"Parallel tasks: {parallel}")
+    if auth_file:
+        print(f"Using auth file: {auth_file}")
     print("="*60)
     
     # Create a semaphore to limit concurrent tasks
@@ -738,6 +1143,8 @@ async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str,
             print(f"Processing task {task_index}/{len(tasks)}")
             print(f"URL: {url}")
             print(f"Output directory: {output_dir}")
+            if auth_file:
+                print(f"Auth file: {auth_file}")
             print(f"{'='*40}\n")
             
             try:
@@ -748,13 +1155,18 @@ async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str,
                     user_agent=user_agent,
                     proxy=proxy,
                     ext=ext,
-                    verbose=verbose
+                    verbose=verbose,
+                    auth_file=auth_file
                 )
                 
                 # Print task summary
                 print(f"\nTask {task_index} completed:")
                 print(f"  URL: {url}")
                 print(f"  Output directory: {output_dir}")
+                if auth_file:
+                    print(f"  Authentication: {'Used' if stats.get('auth_used') else 'Not used'}")
+                    if stats.get('auth_used'):
+                        print(f"  Login successful: {stats.get('login_successful', 'Unknown')}")
                 print(f"  Images found: {stats.get('total', 0)}")
                 print(f"  Successfully extracted: {stats.get('success', 0)}")
                 print(f"  Failed extractions: {stats.get('failed', 0)}")
@@ -791,13 +1203,228 @@ async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str,
     return all_stats
 
 
+async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str, 
+                             proxy: str, ext: str, verbose: bool, parallel: int = 3, auth_file: str = None) -> List[dict]:
+    """
+    Process multiple tasks with parallel execution.
+    
+    Args:
+        tasks: List of tuples (url, output_dir)
+        timeout: Navigation timeout in milliseconds
+        user_agent: Custom user agent string
+        proxy: Proxy URL
+        ext: Default file extension
+        verbose: Verbose logging flag
+        parallel: Maximum number of parallel tasks (default: 3)
+        auth_file: Path to authentication configuration file (optional)
+        
+    Returns:
+        List of task statistics dictionaries
+    """
+    all_stats = []
+    
+    print("\n" + "="*60)
+    print("BATCH PROCESSING STARTED")
+    print("="*60)
+    print(f"Total tasks: {len(tasks)}")
+    print(f"Parallel tasks: {parallel}")
+    if auth_file:
+        print(f"Using auth file: {auth_file}")
+    print("="*60)
+    
+    playwright_instance = None
+    browser = None
+    context = None
+    page = None
+    auth_config = None
+    login_successful = False
+    
+    try:
+        # Create Playwright instance
+        playwright_instance = await async_playwright().start()
+        
+        # Launch browser
+        launch_options = {'headless': True}
+        if proxy:
+            launch_options['proxy'] = {'server': proxy}
+        
+        browser = await playwright_instance.chromium.launch(**launch_options)
+        
+        # Enhanced browser context options to avoid bot detection
+        context_options = {
+            'viewport': {'width': 1920, 'height': 1080},
+            'locale': 'zh-CN',
+            'timezone_id': 'Asia/Shanghai',
+            'geolocation': {'latitude': 31.2304, 'longitude': 121.4737},
+            'permissions': ['geolocation'],
+            'color_scheme': 'light',
+            'reduced_motion': 'reduce',
+            'extra_http_headers': {
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
+            }
+        }
+        
+        if user_agent:
+            context_options['user_agent'] = user_agent
+        else:
+            context_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        
+        context = await browser.new_context(**context_options)
+        page = await context.new_page()
+        
+        # Perform login if auth file is provided
+        if auth_file:
+            try:
+                logger.info(f"Loading authentication configuration from {auth_file}")
+                auth_config = parse_auth_file(auth_file)
+                
+                if auth_config:
+                    logger.info("Attempting to log in before processing batch tasks...")
+                    login_successful = await perform_login(page, auth_config, timeout=timeout)
+                    
+                    if login_successful:
+                        logger.info("Login successful for batch processing")
+                        # Verify login status
+                        if auth_config.get('base_url'):
+                            login_verified = await is_logged_in(page, check_url=auth_config.get('base_url'), timeout=5000)
+                            if login_verified:
+                                logger.info("Login verified for batch processing")
+                            else:
+                                logger.warning("Login status could not be verified, but continuing anyway")
+                    else:
+                        logger.warning("Login failed for batch processing, continuing without authentication")
+                else:
+                    logger.warning("No authentication configuration loaded for batch processing")
+            except Exception as e:
+                logger.error(f"Error during authentication for batch processing: {e}")
+                logger.warning("Continuing without authentication for batch processing")
+    
+    except Exception as e:
+        logger.error(f"Error setting up browser for batch processing: {e}")
+        # Clean up and fall back to individual task processing
+        if page:
+            await page.close()
+        if context:
+            await context.close()
+        if browser:
+            await browser.close()
+        if playwright_instance:
+            await playwright_instance.stop()
+        
+        # Fall back to original implementation
+        return await process_batch_tasks_fallback(tasks, timeout, user_agent, proxy, ext, verbose, parallel, auth_file)
+    
+    # Create a semaphore to limit concurrent tasks
+    semaphore = asyncio.Semaphore(parallel)
+    
+    async def process_task_with_semaphore(task_index, url, output_dir):
+        async with semaphore:
+            print(f"\n{'='*40}")
+            print(f"Processing task {task_index}/{len(tasks)}")
+            print(f"URL: {url}")
+            print(f"Output directory: {output_dir}")
+            if auth_file:
+                print(f"Auth file: {auth_file}")
+                print(f"Login status: {'Successful' if login_successful else 'Failed'}")
+            print(f"{'='*40}\n")
+            
+            try:
+                stats = await process_single_task_with_existing_context(
+                    context=context,
+                    url=url,
+                    output_dir=output_dir,
+                    timeout=timeout,
+                    ext=ext,
+                    verbose=verbose,
+                    auth_config=auth_config if auth_file else None,
+                    login_successful=login_successful if auth_file else None
+                )
+                
+                # Print task summary
+                print(f"\nTask {task_index} completed:")
+                print(f"  URL: {url}")
+                print(f"  Output directory: {output_dir}")
+                if auth_file:
+                    print(f"  Authentication: {'Used' if stats.get('auth_used') else 'Not used'}")
+                    if stats.get('auth_used'):
+                        print(f"  Login successful: {stats.get('login_successful', 'Unknown')}")
+                print(f"  Images found: {stats.get('total', 0)}")
+                print(f"  Successfully extracted: {stats.get('success', 0)}")
+                print(f"  Failed extractions: {stats.get('failed', 0)}")
+                if stats.get('total', 0) > 0:
+                    print(f"  Success rate: {stats.get('success', 0)/stats.get('total', 0)*100:.1f}%")
+                
+                return stats
+                
+            except Exception as e:
+                logger.error(f"Failed to process task {task_index} ({url}): {e}")
+                print(f"\nTask {task_index} failed: {e}")
+                return {
+                    'url': url,
+                    'output_dir': output_dir,
+                    'error': str(e),
+                    'total': 0,
+                    'success': 0,
+                    'failed': 0
+                }
+    
+    # Create tasks
+    tasks_to_execute = []
+    for i, (url, output_dir) in enumerate(tasks, 1):
+        task = asyncio.create_task(process_task_with_semaphore(i, url, output_dir))
+        tasks_to_execute.append(task)
+    
+    # Wait for all tasks to complete
+    results = await asyncio.gather(*tasks_to_execute, return_exceptions=False)
+    
+    # Collect results
+    for result in results:
+        all_stats.append(result)
+    
+    # Clean up browser resources
+    if page:
+        await page.close()
+    if context:
+        await context.close()
+    if browser:
+        await browser.close()
+    if playwright_instance:
+        await playwright_instance.stop()
+    
+    return all_stats
+
+
 async def main_async(args):
     """Main async function."""
     # Check if we're in batch mode or single mode
     if args.list_file:
         # Batch mode
-        # If url is provided, use it as base URL for relative URLs in the list
-        base_url = args.url if args.url else None
+        # Determine base URL for relative URLs in the list
+        base_url = None
+        
+        # Priority 1: Use URL from command line if provided
+        if args.url:
+            base_url = args.url
+            logger.info(f"Using command line URL as base URL: {base_url}")
+        # Priority 2: Use base_url from auth.json if auth-file is provided
+        elif args.auth_file:
+            try:
+                auth_config = parse_auth_file(args.auth_file)
+                if auth_config and auth_config.get('base_url'):
+                    base_url = auth_config.get('base_url')
+                    logger.info(f"Using auth.json base URL for list file: {base_url}")
+            except Exception as e:
+                logger.warning(f"Could not parse auth file for base URL: {e}")
+        
         tasks = read_list_file(args.list_file, base_url=base_url)
         
         if not tasks:
@@ -812,7 +1439,8 @@ async def main_async(args):
             proxy=args.proxy,
             ext=args.ext,
             verbose=args.verbose,
-            parallel=args.parallel
+            parallel=args.parallel,
+            auth_file=args.auth_file
         )
         
         # Print batch summary
@@ -828,9 +1456,16 @@ async def main_async(args):
         total_success = sum(stats.get('success', 0) for stats in all_stats)
         total_failed = sum(stats.get('failed', 0) for stats in all_stats)
         
+        # Count authentication statistics
+        auth_used_tasks = sum(1 for stats in all_stats if stats.get('auth_used', False))
+        successful_auth_tasks = sum(1 for stats in all_stats if stats.get('auth_used', False) and stats.get('login_successful', False))
+        
         print(f"Total tasks processed: {total_tasks}")
         print(f"Successful tasks: {successful_tasks}")
         print(f"Failed tasks: {failed_tasks}")
+        if args.auth_file:
+            print(f"Tasks with authentication: {auth_used_tasks}")
+            print(f"Successful authentications: {successful_auth_tasks}")
         print(f"Total images found: {total_images}")
         print(f"Total successfully extracted: {total_success}")
         print(f"Total failed extractions: {total_failed}")
@@ -843,9 +1478,15 @@ async def main_async(args):
             if 'error' in stats:
                 print(f"  {i}. {stats['url']} - ERROR: {stats['error']}")
             elif stats.get('has_fallback_urls', False):
-                print(f"  {i}. {stats['url']} - Found {len(stats.get('fallback_urls', []))} URLs (not extracted)")
+                auth_info = ""
+                if args.auth_file and stats.get('auth_used'):
+                    auth_info = f" (Auth: {'Success' if stats.get('login_successful') else 'Failed'})"
+                print(f"  {i}. {stats['url']} - Found {len(stats.get('fallback_urls', []))} URLs (not extracted){auth_info}")
             else:
-                print(f"  {i}. {stats['url']} - {stats.get('success', 0)}/{stats.get('total', 0)} images extracted")
+                auth_info = ""
+                if args.auth_file and stats.get('auth_used'):
+                    auth_info = f" (Auth: {'Success' if stats.get('login_successful') else 'Failed'})"
+                print(f"  {i}. {stats['url']} - {stats.get('success', 0)}/{stats.get('total', 0)} images extracted{auth_info}")
         
         print("="*60)
         
@@ -864,7 +1505,8 @@ async def main_async(args):
             user_agent=args.user_agent,
             proxy=args.proxy,
             ext=args.ext,
-            verbose=args.verbose
+            verbose=args.verbose,
+            auth_file=args.auth_file
         )
         
         # Print summary for single task
@@ -876,6 +1518,10 @@ async def main_async(args):
         print("="*60)
         print(f"URL: {stats['url']}")
         print(f"Images saved to: {stats['output_dir']}")
+        if args.auth_file:
+            print(f"Authentication: {'Used' if stats.get('auth_used') else 'Not used'}")
+            if stats.get('auth_used'):
+                print(f"Login successful: {stats.get('login_successful', 'Unknown')}")
         print(f"Total images found: {stats.get('total', 0)}")
         print(f"Successfully extracted: {stats.get('success', 0)}")
         print(f"Failed extractions: {stats.get('failed', 0)}")
@@ -969,6 +1615,12 @@ def main():
         type=int,
         default=3,
         help='Maximum number of parallel tasks (default: 3)'
+    )
+    
+    parser.add_argument(
+        '--auth-file',
+        dest='auth_file',
+        help='Path to authentication configuration file (auth.json) for website login'
     )
     
     # Parse arguments
