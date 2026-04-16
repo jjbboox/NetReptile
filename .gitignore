@@ -173,5 +173,6 @@ Desktop.ini
 url_list/
 temp/
 output/
+listoutput/
 logs/
 *.log

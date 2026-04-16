@@ -313,7 +313,7 @@ def format_filename(index: int, total: int, extension: str) -> str:
     return f"{formatted_index}.{extension}"
 
 
-def read_list_file(list_file_path: str) -> List[tuple]:
+def read_list_file(list_file_path: str, base_url: str = None) -> List[tuple]:
     """
     Read list file for batch processing.
     Supports multiple formats:
@@ -323,6 +323,7 @@ def read_list_file(list_file_path: str) -> List[tuple]:
     
     Args:
         list_file_path: Path to the list file
+        base_url: Optional base URL to prepend to relative URLs in the list
         
     Returns:
         List of tuples (url, output_dir)
@@ -341,34 +342,28 @@ def read_list_file(list_file_path: str) -> List[tuple]:
                 # Check if line contains an <a href> tag (like netreptile.py)
                 # This needs to be handled first because HTML tags can contain quotes
                 if '<a href=' in line.lower() or '<a href =' in line.lower():
-                    # Try to extract URL from href attribute
+                    # Try to extract URL from href attribute and link text
                     import re
-                    match = re.search(r'href\s*=\s*["\']([^"\']+)["\']', line, re.IGNORECASE)
+                    # Pattern to match <a href="url">text</a>
+                    match = re.search(r'<a\s+href\s*=\s*["\']([^"\']+)["\'][^>]*>([^<]+)</a>', line, re.IGNORECASE)
                     if match:
                         extracted_url = match.group(1)
+                        link_text = match.group(2).strip()
                         logger.debug(f"Line {line_num}: Extracted URL from <a href> tag: {extracted_url}")
+                        logger.debug(f"Line {line_num}: Link text: {link_text}")
                         
                         # Now we need to extract the output directory
                         # The output directory is typically after the HTML tag
                         # Remove the HTML tag part and get what's after it
-                        tag_pattern = r'<a\s+href\s*=\s*["\'][^"\']+["\'][^>]*>.*?</a>'
+                        tag_pattern = r'<a\s+href\s*=\s*["\'][^"\']+["\'][^>]*>[^<]+</a>'
                         line_without_tag = re.sub(tag_pattern, '', line, flags=re.IGNORECASE).strip()
                         
                         if line_without_tag:
-                            # Output directory is what remains after removing the tag
+                            # If there's text after the tag, use it as output directory
                             output_dir = line_without_tag
                         else:
-                            # If nothing remains, try to find output directory in the line
-                            # Look for non-HTML parts
-                            parts = re.split(r'\s+', line)
-                            # Find the first part that doesn't look like HTML
-                            for part in parts:
-                                if not ('<' in part or '>' in part or 'href=' in part.lower()):
-                                    output_dir = part
-                                    break
-                            else:
-                                logger.warning(f"Line {line_num}: Could not find output directory in HTML tag line: {line}")
-                                continue
+                            # If nothing remains after the tag, use link text as output directory
+                            output_dir = link_text
                         
                         tasks.append((extracted_url, output_dir))
                         continue
@@ -455,9 +450,16 @@ def read_list_file(list_file_path: str) -> List[tuple]:
             logger.error(f"No valid tasks found in list file: {list_file_path}")
             return []
         
-        # Process URLs: validate and add https:// if needed
+        # Process URLs: validate and add https:// if needed, and join with base_url if provided
         processed_tasks = []
         for url, output_dir in tasks:
+            # If base_url is provided and URL is relative, join them
+            if base_url and not url.startswith(('http://', 'https://', 'data:')):
+                # Join base_url with relative URL
+                joined_url = urljoin(base_url, url)
+                logger.debug(f"Joined URL with base URL: {url} -> {joined_url}")
+                url = joined_url
+            
             # Validate URL format
             if not url.startswith(('http://', 'https://')):
                 logger.warning(f"URL doesn't start with http:// or https://: {url}")
@@ -468,6 +470,8 @@ def read_list_file(list_file_path: str) -> List[tuple]:
             processed_tasks.append((url, output_dir))
         
         logger.info(f"Loaded {len(processed_tasks)} tasks from list file: {list_file_path}")
+        if base_url:
+            logger.info(f"Using base URL for relative URLs: {base_url}")
         return processed_tasks
         
     except FileNotFoundError:
@@ -700,9 +704,9 @@ async def process_single_task(url: str, output_dir: str, timeout: int, user_agen
 
 
 async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str, 
-                             proxy: str, ext: str, verbose: bool) -> List[dict]:
+                             proxy: str, ext: str, verbose: bool, parallel: int = 3) -> List[dict]:
     """
-    Process multiple tasks in sequence.
+    Process multiple tasks with parallel execution.
     
     Args:
         tasks: List of tuples (url, output_dir)
@@ -711,6 +715,7 @@ async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str,
         proxy: Proxy URL
         ext: Default file extension
         verbose: Verbose logging flag
+        parallel: Maximum number of parallel tasks (default: 3)
         
     Returns:
         List of task statistics dictionaries
@@ -721,54 +726,67 @@ async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str,
     print("BATCH PROCESSING STARTED")
     print("="*60)
     print(f"Total tasks: {len(tasks)}")
+    print(f"Parallel tasks: {parallel}")
     print("="*60)
     
-    for i, (url, output_dir) in enumerate(tasks, 1):
-        print(f"\n{'='*40}")
-        print(f"Processing task {i}/{len(tasks)}")
-        print(f"URL: {url}")
-        print(f"Output directory: {output_dir}")
-        print(f"{'='*40}\n")
-        
-        try:
-            stats = await process_single_task(
-                url=url,
-                output_dir=output_dir,
-                timeout=timeout,
-                user_agent=user_agent,
-                proxy=proxy,
-                ext=ext,
-                verbose=verbose
-            )
+    # Create a semaphore to limit concurrent tasks
+    semaphore = asyncio.Semaphore(parallel)
+    
+    async def process_task_with_semaphore(task_index, url, output_dir):
+        async with semaphore:
+            print(f"\n{'='*40}")
+            print(f"Processing task {task_index}/{len(tasks)}")
+            print(f"URL: {url}")
+            print(f"Output directory: {output_dir}")
+            print(f"{'='*40}\n")
             
-            all_stats.append(stats)
-            
-            # Print task summary
-            print(f"\nTask {i} completed:")
-            print(f"  URL: {url}")
-            print(f"  Output directory: {output_dir}")
-            print(f"  Images found: {stats.get('total', 0)}")
-            print(f"  Successfully extracted: {stats.get('success', 0)}")
-            print(f"  Failed extractions: {stats.get('failed', 0)}")
-            if stats.get('total', 0) > 0:
-                print(f"  Success rate: {stats.get('success', 0)/stats.get('total', 0)*100:.1f}%")
-            
-            # Add delay between tasks to avoid rate limiting
-            if i < len(tasks):
-                print(f"\nWaiting 2 seconds before next task...")
-                await asyncio.sleep(2)
+            try:
+                stats = await process_single_task(
+                    url=url,
+                    output_dir=output_dir,
+                    timeout=timeout,
+                    user_agent=user_agent,
+                    proxy=proxy,
+                    ext=ext,
+                    verbose=verbose
+                )
                 
-        except Exception as e:
-            logger.error(f"Failed to process task {i} ({url}): {e}")
-            print(f"\nTask {i} failed: {e}")
-            all_stats.append({
-                'url': url,
-                'output_dir': output_dir,
-                'error': str(e),
-                'total': 0,
-                'success': 0,
-                'failed': 0
-            })
+                # Print task summary
+                print(f"\nTask {task_index} completed:")
+                print(f"  URL: {url}")
+                print(f"  Output directory: {output_dir}")
+                print(f"  Images found: {stats.get('total', 0)}")
+                print(f"  Successfully extracted: {stats.get('success', 0)}")
+                print(f"  Failed extractions: {stats.get('failed', 0)}")
+                if stats.get('total', 0) > 0:
+                    print(f"  Success rate: {stats.get('success', 0)/stats.get('total', 0)*100:.1f}%")
+                
+                return stats
+                
+            except Exception as e:
+                logger.error(f"Failed to process task {task_index} ({url}): {e}")
+                print(f"\nTask {task_index} failed: {e}")
+                return {
+                    'url': url,
+                    'output_dir': output_dir,
+                    'error': str(e),
+                    'total': 0,
+                    'success': 0,
+                    'failed': 0
+                }
+    
+    # Create tasks
+    tasks_to_execute = []
+    for i, (url, output_dir) in enumerate(tasks, 1):
+        task = asyncio.create_task(process_task_with_semaphore(i, url, output_dir))
+        tasks_to_execute.append(task)
+    
+    # Wait for all tasks to complete
+    results = await asyncio.gather(*tasks_to_execute, return_exceptions=False)
+    
+    # Collect results
+    for result in results:
+        all_stats.append(result)
     
     return all_stats
 
@@ -778,7 +796,9 @@ async def main_async(args):
     # Check if we're in batch mode or single mode
     if args.list_file:
         # Batch mode
-        tasks = read_list_file(args.list_file)
+        # If url is provided, use it as base URL for relative URLs in the list
+        base_url = args.url if args.url else None
+        tasks = read_list_file(args.list_file, base_url=base_url)
         
         if not tasks:
             logger.error("No valid tasks found in list file. Exiting.")
@@ -791,7 +811,8 @@ async def main_async(args):
             user_agent=args.user_agent,
             proxy=args.proxy,
             ext=args.ext,
-            verbose=args.verbose
+            verbose=args.verbose,
+            parallel=args.parallel
         )
         
         # Print batch summary
@@ -890,22 +911,22 @@ def main():
   
   # Batch mode with list file
   %(prog)s --list urls.txt
+  %(prog)s --list urls.txt --parallel 5
+  %(prog)s --list urls.txt --timeout 60000 --parallel 2 --verbose
         """
     )
     
-    # Mutually exclusive group for single URL vs batch mode
-    group = parser.add_mutually_exclusive_group(required=True)
-    
-    group.add_argument(
+    # Arguments for both single URL and batch mode
+    parser.add_argument(
         'url',
         nargs='?',
-        help='URL of the web page to fetch images from (single mode)'
+        help='URL of the web page to fetch images from (single mode) or base URL for list file (batch mode)'
     )
     
-    group.add_argument(
+    parser.add_argument(
         '--list',
         dest='list_file',
-        help='List file for batch processing (each line: URL output_dir)'
+        help='List file for batch processing (each line: URL output_dir). If url is also provided, it will be used as base URL for relative URLs in the list.'
     )
     
     parser.add_argument(
@@ -941,6 +962,13 @@ def main():
         '--verbose',
         action='store_true',
         help='Enable verbose logging'
+    )
+    
+    parser.add_argument(
+        '--parallel',
+        type=int,
+        default=3,
+        help='Maximum number of parallel tasks (default: 3)'
     )
     
     # Parse arguments
