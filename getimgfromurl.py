@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+"""
+Get Images from URL - Download all images from <img> tags within <pre> tags on a webpage
+
+Usage:
+    python getimgfromurl.py <url> <output_dir> [options]
+    
+Examples:
+    # Download all images from <pre> tags on a webpage to specified directory
+    python getimgfromurl.py https://example.com ./output
+    
+    # Download images with custom timeout
+    python getimgfromurl.py https://example.com ./output --timeout 30000
+    
+    # Use specific user agent
+    python getimgfromurl.py https://example.com ./output --user-agent "Custom Agent"
+    
+    # Specify image file extension
+    python getimgfromurl.py https://example.com ./output --ext png
+    
+    # Use proxy
+    python getimgfromurl.py https://example.com ./output --proxy http://proxy.example.com:8080
+"""
+
+import argparse
+import sys
+import os
+import re
+import logging
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+import asyncio
+import random
+from typing import List, Optional
+from playwright.async_api import async_playwright
+import aiofiles
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+async def create_browser_context(p, url: str, timeout: int = 30000, user_agent: str = None, proxy: str = None):
+    """
+    Create browser context and navigate to URL using Playwright.
+    
+    Args:
+        p: Playwright instance
+        url: The URL to fetch
+        timeout: Maximum navigation timeout in milliseconds
+        user_agent: Custom user agent string
+        proxy: Proxy URL (optional)
+        
+    Returns:
+        Tuple of (browser, context, page, html_content)
+    """
+    # Launch browser (Chromium by default)
+    launch_options = {'headless': True}
+    
+    if proxy:
+        launch_options['proxy'] = {'server': proxy}
+    
+    browser = await p.chromium.launch(**launch_options)
+    
+    # Enhanced browser context options to avoid bot detection
+    context_options = {
+        'viewport': {'width': 1920, 'height': 1080},
+        'locale': 'zh-CN',
+        'timezone_id': 'Asia/Shanghai',
+        'geolocation': {'latitude': 31.2304, 'longitude': 121.4737},
+        'permissions': ['geolocation'],
+        'color_scheme': 'light',
+        'reduced_motion': 'reduce',
+        'extra_http_headers': {
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+        }
+    }
+    
+    if user_agent:
+        context_options['user_agent'] = user_agent
+    else:
+        context_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    
+    context = await browser.new_context(**context_options)
+    page = await context.new_page()
+    
+    try:
+        logger.info(f"Navigating to {url}")
+        try:
+            await page.goto(url, wait_until='networkidle', timeout=timeout)
+        except Exception as e:
+            logger.warning(f"Navigation timeout occurred: {e}")
+            logger.info("Stopping page loading and continuing with already loaded content...")
+            # Stop page loading
+            await page.evaluate("window.stop()")
+        
+        # Wait for any dynamic content to load
+        try:
+            await page.wait_for_load_state('networkidle', timeout=5000)
+        except Exception:
+            logger.info("Continuing with current page state...")
+        
+        # Get the complete HTML content
+        content = await page.content()
+        logger.info(f"Successfully fetched HTML content from {url}")
+        
+        return browser, context, page, content
+        
+    except Exception as e:
+        logger.error(f"Error fetching {url}: {e}")
+        # Clean up on error
+        await page.close()
+        await context.close()
+        await browser.close()
+        raise
+
+
+def extract_img_urls_from_pre_tags(html_content: str, base_url: str) -> List[str]:
+    """
+    Extract all image URLs from <img> tags within <pre> tags.
+    
+    Args:
+        html_content: HTML content as string
+        base_url: Base URL for resolving relative image URLs
+        
+    Returns:
+        List of image URLs
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.error("BeautifulSoup4 is required. Install with: pip install beautifulsoup4")
+        sys.exit(1)
+    
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Find all <pre> tags
+    pre_tags = soup.find_all('pre')
+    
+    if not pre_tags:
+        logger.warning("No <pre> tags found on the page")
+        return []
+    
+    logger.info(f"Found {len(pre_tags)} <pre> tags on the page")
+    
+    # Extract all <img> tags within <pre> tags
+    img_urls = []
+    for i, pre_tag in enumerate(pre_tags, 1):
+        img_tags = pre_tag.find_all('img')
+        
+        if img_tags:
+            logger.info(f"Found {len(img_tags)} <img> tags in <pre> tag #{i}")
+            
+            for img_tag in img_tags:
+                if img_tag.has_attr('src'):
+                    img_url = img_tag['src']
+                    
+                    # Resolve relative URLs
+                    if not img_url.startswith(('http://', 'https://', 'data:')):
+                        img_url = urljoin(base_url, img_url)
+                    
+                    # Skip data URLs
+                    if img_url.startswith('data:'):
+                        logger.debug(f"Skipping data URL image")
+                        continue
+                    
+                    img_urls.append(img_url)
+                    logger.debug(f"Found image URL: {img_url}")
+    
+    logger.info(f"Total image URLs found: {len(img_urls)}")
+    return img_urls
+
+
+async def wait_for_pre_images_loaded(page, timeout: int = 30000) -> bool:
+    """
+    Wait for all <img> tags within <pre> tags to load.
+    
+    Args:
+        page: Playwright page object
+        timeout: Maximum wait time in milliseconds
+        
+    Returns:
+        True if images loaded successfully, False otherwise
+    """
+    try:
+        logger.info("Waiting for images in <pre> tags to load...")
+        
+        # Wait for at least one <pre> tag to be present
+        await page.wait_for_selector('pre', timeout=timeout)
+        
+        # Wait for images within <pre> tags to load
+        # We'll use a JavaScript approach to check image loading status
+        js_code = """
+        () => {
+            // Find all <img> tags within <pre> tags
+            const preTags = document.querySelectorAll('pre');
+            const allImages = [];
+            
+            for (const pre of preTags) {
+                const images = pre.querySelectorAll('img');
+                for (const img of images) {
+                    allImages.push(img);
+                }
+            }
+            
+            // Check if all images are loaded
+            if (allImages.length === 0) {
+                return {count: 0, loaded: 0, allLoaded: true};
+            }
+            
+            let loadedCount = 0;
+            for (const img of allImages) {
+                if (img.complete && img.naturalWidth > 0) {
+                    loadedCount++;
+                }
+            }
+            
+            return {
+                count: allImages.length,
+                loaded: loadedCount,
+                allLoaded: loadedCount === allImages.length
+            };
+        }
+        """
+        
+        # Wait for images to load with timeout
+        start_time = asyncio.get_event_loop().time()
+        while True:
+            result = await page.evaluate(js_code)
+            
+            if result['allLoaded'] or result['count'] == 0:
+                logger.info(f"Images loaded: {result['loaded']}/{result['count']}")
+                return True
+            
+            # Check timeout
+            elapsed = (asyncio.get_event_loop().time() - start_time) * 1000
+            if elapsed > timeout:
+                logger.warning(f"Timeout waiting for images to load. Loaded: {result['loaded']}/{result['count']}")
+                return False
+            
+            # Wait a bit before checking again
+            await asyncio.sleep(0.5)
+            
+    except Exception as e:
+        logger.warning(f"Error waiting for images to load: {e}")
+        return False
+
+
+def determine_file_extension(url: str, default_ext: str = 'jpg') -> str:
+    """
+    Determine file extension from URL or use default.
+    
+    Args:
+        url: Image URL
+        default_ext: Default extension if cannot determine from URL
+        
+    Returns:
+        File extension (without dot)
+    """
+    # Try to extract extension from URL
+    parsed_url = urlparse(url)
+    path = parsed_url.path
+    
+    if '.' in path:
+        ext = path.split('.')[-1].lower()
+        # Remove query parameters if any
+        ext = ext.split('?')[0]
+        
+        # Common image extensions
+        valid_extensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'ico']
+        
+        if ext in valid_extensions:
+            # Normalize jpeg to jpg
+            if ext == 'jpeg':
+                return 'jpg'
+            return ext
+    
+    # Use default extension
+    return default_ext
+
+
+def format_filename(index: int, total: int, extension: str) -> str:
+    """
+    Format filename with leading zeros based on total count.
+    
+    Args:
+        index: Image index (1-based)
+        total: Total number of images
+        extension: File extension
+        
+    Returns:
+        Formatted filename
+    """
+    # Calculate number of digits needed
+    # Use at least 2 digits for better readability (01, 02, etc.)
+    digits = max(2, len(str(total)))
+    
+    # Format with leading zeros
+    formatted_index = str(index).zfill(digits)
+    
+    return f"{formatted_index}.{extension}"
+
+
+async def extract_images_only(page, output_dir: Path, default_ext: str = 'jpg') -> dict:
+    """
+    Extract images from <pre> tags and save directly to output directory.
+    
+    Args:
+        page: Playwright page object with loaded page
+        output_dir: Directory where images will be saved
+        default_ext: Default file extension for images
+        
+    Returns:
+        Dictionary with extraction statistics
+    """
+    try:
+        logger.info(f"Extracting images to: {output_dir}")
+        
+        # Create output directory
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Find all images in <pre> tags
+        js_code = """
+        () => {
+            const preTags = document.querySelectorAll('pre');
+            const images = [];
+            
+            for (const pre of preTags) {
+                const imgElements = pre.querySelectorAll('img');
+                for (const img of imgElements) {
+                    // Skip data URLs
+                    if (!img.src || img.src.startsWith('data:')) {
+                        continue;
+                    }
+                    
+                    // Get image information
+                    images.push({
+                        src: img.src,
+                        currentSrc: img.currentSrc || img.src,
+                        alt: img.alt || '',
+                        width: img.naturalWidth || img.width || 0,
+                        height: img.naturalHeight || img.height || 0
+                    });
+                }
+            }
+            
+            return images;
+        }
+        """
+        
+        # Execute JavaScript to get image information
+        images_info = await page.evaluate(js_code)
+        
+        if not images_info:
+            logger.warning("No images found in <pre> tags")
+            return {'total': 0, 'success': 0, 'failed': 0}
+        
+        logger.info(f"Found {len(images_info)} images in <pre> tags")
+        
+        successful_extractions = 0
+        failed_extractions = 0
+        
+        # Download each image and save directly to output directory
+        for i, img_info in enumerate(images_info, 1):
+            try:
+                # Determine file extension from URL
+                ext = determine_file_extension(img_info['src'], default_ext)
+                
+                # Format filename for output
+                output_filename = format_filename(i, len(images_info), ext)
+                output_filepath = output_dir / output_filename
+                
+                # Add small delay to avoid rate limiting
+                if i > 1:
+                    await asyncio.sleep(0.5)
+                
+                # Download image using page.request.get()
+                try:
+                    response = await page.request.get(img_info['src'])
+                    
+                    if response.ok:
+                        # Get the response body
+                        image_data = await response.body()
+                        
+                        # Save to output directory
+                        async with aiofiles.open(output_filepath, 'wb') as f:
+                            await f.write(image_data)
+                        
+                        successful_extractions += 1
+                        print(f"[{i}/{len(images_info)}] Extracted: {img_info['src']}")
+                        print(f"     Saved to: {output_filepath.name}")
+                    else:
+                        logger.warning(f"Failed to download {img_info['src']}: HTTP {response.status}")
+                        failed_extractions += 1
+                        print(f"[{i}/{len(images_info)}] Failed: HTTP {response.status} - {img_info['src']}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error downloading image {i}: {e}")
+                    failed_extractions += 1
+                    print(f"[{i}/{len(images_info)}] Error: {img_info['src']} - {e}")
+                    
+            except Exception as e:
+                failed_extractions += 1
+                logger.error(f"Error processing image {i}: {e}")
+                print(f"[{i}/{len(images_info)}] Error: {img_info['src']} - {e}")
+        
+        logger.info(f"Images extracted to: {output_dir}")
+        
+        return {
+            'total': len(images_info),
+            'success': successful_extractions,
+            'failed': failed_extractions
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in extract_images_only: {e}")
+        return {'total': 0, 'success': 0, 'failed': 0}
+
+
+async def main_async(args):
+    """Main async function."""
+    # Set logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose mode enabled")
+    
+    # Validate URL
+    if not args.url.startswith(('http://', 'https://')):
+        logger.warning(f"URL doesn't start with http:// or https://: {args.url}")
+        # Try to add https:// if missing
+        args.url = f"https://{args.url}"
+        logger.info(f"Trying with: {args.url}")
+    
+    # Create output directory path
+    output_dir = Path(args.output_dir)
+    
+    playwright_instance = None
+    browser = None
+    context = None
+    page = None
+    
+    try:
+        # Create Playwright instance
+        playwright_instance = await async_playwright().start()
+        
+        # Step 1: Create browser context and navigate to URL
+        logger.info(f"Creating browser context and navigating to {args.url}")
+        browser, context, page, html_content = await create_browser_context(
+            playwright_instance,
+            args.url, 
+            timeout=args.timeout,
+            user_agent=args.user_agent,
+            proxy=args.proxy
+        )
+        
+        # Step 2: Wait for images in <pre> tags to load
+        logger.info("Waiting for images in <pre> tags to load...")
+        images_loaded = await wait_for_pre_images_loaded(page, timeout=args.timeout)
+        
+        if not images_loaded:
+            logger.warning("Images may not have fully loaded, but will try to save what's available")
+        
+        # Step 3: Extract images only (no page saving)
+        logger.info("Extracting images...")
+        stats = await extract_images_only(
+            page,
+            output_dir,
+            default_ext=args.ext
+        )
+        
+        if stats['total'] == 0:
+            # Fallback: try to extract URLs from HTML
+            logger.warning("No images extracted, falling back to HTML extraction...")
+            img_urls = extract_img_urls_from_pre_tags(html_content, args.url)
+            
+            if img_urls:
+                logger.info(f"Found {len(img_urls)} image URLs in HTML")
+                print(f"Found {len(img_urls)} image URLs but could not extract them")
+                print("Image URLs found:")
+                for i, url in enumerate(img_urls, 1):
+                    print(f"  {i}. {url}")
+            else:
+                logger.error("No images found in <pre> tags on the page")
+                print("No images found in <pre> tags on the page")
+            return
+        
+        # Print summary
+        print("\n" + "="*60)
+        print("IMAGE EXTRACTION SUMMARY")
+        print("="*60)
+        print(f"URL: {args.url}")
+        print(f"Images saved to: {output_dir.absolute()}")
+        print(f"Total images found: {stats['total']}")
+        print(f"Successfully extracted: {stats['success']}")
+        print(f"Failed extractions: {stats['failed']}")
+        if stats['total'] > 0:
+            print(f"Success rate: {stats['success']/stats['total']*100:.1f}%")
+        
+        if stats['success'] > 0:
+            print(f"\nImages saved with filenames:")
+            # List saved files
+            for i in range(1, stats['success'] + 1):
+                filename = format_filename(i, stats['total'], args.ext)
+                filepath = output_dir / filename
+                if filepath.exists():
+                    print(f"  {filename} ({filepath.stat().st_size:,} bytes)")
+        
+        print("="*60)
+        
+    except Exception as e:
+        logger.error(f"Error in main process: {e}")
+        raise
+    finally:
+        # Clean up browser resources
+        if page:
+            await page.close()
+        if context:
+            await context.close()
+        if browser:
+            await browser.close()
+        if playwright_instance:
+            await playwright_instance.stop()
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Download all images from <img> tags within <pre> tags on a webpage',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  %(prog)s https://example.com ./output
+  %(prog)s https://example.com ./output --timeout 30000
+  %(prog)s https://example.com ./output --user-agent "Custom Agent"
+  %(prog)s https://example.com ./output --ext png
+  %(prog)s https://example.com ./output --proxy http://proxy.example.com:8080
+  %(prog)s https://example.com ./output --verbose
+        """
+    )
+    
+    parser.add_argument(
+        'url',
+        help='URL of the web page to fetch images from'
+    )
+    
+    parser.add_argument(
+        'output_dir',
+        help='Directory where images will be saved'
+    )
+    
+    parser.add_argument(
+        '--timeout',
+        type=int,
+        default=30000,
+        help='Navigation and download timeout in milliseconds (default: 30000)'
+    )
+    
+    parser.add_argument(
+        '--user-agent',
+        help='Custom user agent string'
+    )
+    
+    parser.add_argument(
+        '--ext',
+        default='jpg',
+        help='Default file extension for images (default: jpg)'
+    )
+    
+    parser.add_argument(
+        '--proxy',
+        help='Proxy URL (e.g., http://proxy.example.com:8080)'
+    )
+    
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Handle Windows-specific asyncio issues
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
+    loop = None
+    try:
+        # Get or create event loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Run the main async function
+        loop.run_until_complete(main_async(args))
+        
+    except KeyboardInterrupt:
+        logger.info("Operation cancelled by user")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        sys.exit(1)
+    finally:
+        # Clean up the event loop
+        if loop:
+            try:
+                # Cancel all running tasks
+                tasks = asyncio.all_tasks(loop)
+                for task in tasks:
+                    task.cancel()
+                
+                # Run loop until all tasks are cancelled
+                if tasks:
+                    loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+                
+                # Shutdown async generators
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                
+                # Close the loop
+                loop.close()
+            except Exception:
+                pass  # Ignore errors during cleanup
+
+
+if __name__ == "__main__":
+    main()
