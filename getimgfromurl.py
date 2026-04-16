@@ -313,6 +313,171 @@ def format_filename(index: int, total: int, extension: str) -> str:
     return f"{formatted_index}.{extension}"
 
 
+def read_list_file(list_file_path: str) -> List[tuple]:
+    """
+    Read list file for batch processing.
+    Supports multiple formats:
+    1. CSV format with quotes (e.g., "url","output_dir")
+    2. Space/tab separated format (e.g., url output_dir)
+    3. Single URL per line (for backward compatibility with netreptile.py format)
+    
+    Args:
+        list_file_path: Path to the list file
+        
+    Returns:
+        List of tuples (url, output_dir)
+    """
+    tasks = []
+    
+    try:
+        with open(list_file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Check if line contains an <a href> tag (like netreptile.py)
+                # This needs to be handled first because HTML tags can contain quotes
+                if '<a href=' in line.lower() or '<a href =' in line.lower():
+                    # Try to extract URL from href attribute
+                    import re
+                    match = re.search(r'href\s*=\s*["\']([^"\']+)["\']', line, re.IGNORECASE)
+                    if match:
+                        extracted_url = match.group(1)
+                        logger.debug(f"Line {line_num}: Extracted URL from <a href> tag: {extracted_url}")
+                        
+                        # Now we need to extract the output directory
+                        # The output directory is typically after the HTML tag
+                        # Remove the HTML tag part and get what's after it
+                        tag_pattern = r'<a\s+href\s*=\s*["\'][^"\']+["\'][^>]*>.*?</a>'
+                        line_without_tag = re.sub(tag_pattern, '', line, flags=re.IGNORECASE).strip()
+                        
+                        if line_without_tag:
+                            # Output directory is what remains after removing the tag
+                            output_dir = line_without_tag
+                        else:
+                            # If nothing remains, try to find output directory in the line
+                            # Look for non-HTML parts
+                            parts = re.split(r'\s+', line)
+                            # Find the first part that doesn't look like HTML
+                            for part in parts:
+                                if not ('<' in part or '>' in part or 'href=' in part.lower()):
+                                    output_dir = part
+                                    break
+                            else:
+                                logger.warning(f"Line {line_num}: Could not find output directory in HTML tag line: {line}")
+                                continue
+                        
+                        tasks.append((extracted_url, output_dir))
+                        continue
+                    else:
+                        logger.warning(f"Line {line_num}: Could not extract URL from <a href> tag: {line}")
+                        continue
+                
+                # Try to parse as CSV format first (with quotes)
+                import csv
+                import io
+                
+                # Check if line contains quoted fields (CSV format)
+                if '"' in line or "'" in line:
+                    try:
+                        # Use csv.reader to parse the line
+                        reader = csv.reader(io.StringIO(line))
+                        parts = next(reader)
+                        
+                        if len(parts) >= 2:
+                            # CSV format: first column is URL, second is output directory
+                            url = parts[0].strip()
+                            output_dir = parts[1].strip()
+                            
+                            # Remove surrounding quotes if present (including different quote types)
+                            # Define all possible quote characters - including various Unicode quotes
+                            left_quotes = ['"', "'", '“', '‘', '「', '『', '〈', '《', '【', '〔']
+                            right_quotes = ['"', "'", '”', '’', '」', '』', '〉', '》', '】', '〕']
+                            
+                            # Also check for UTF-8 RIGHT DOUBLE QUOTATION MARK (U+201D)
+                            # Add more Unicode quote characters
+                            import unicodedata
+                            
+                            # Helper function to check if a character is some kind of quote
+                            def is_quote_char(char):
+                                if not char:
+                                    return False
+                                # Check common quote characters
+                                if char in left_quotes or char in right_quotes:
+                                    return True
+                                # Check Unicode category
+                                try:
+                                    category = unicodedata.category(char)
+                                    # Punctuation categories that might include quotes
+                                    if category.startswith('P'):
+                                        # Check common quote-like punctuation
+                                        if char in '"\'':
+                                            return True
+                                        # Check if it looks like a quote
+                                        name = unicodedata.name(char, '').upper()
+                                        if 'QUOTATION' in name or 'QUOTE' in name or 'APOSTROPHE' in name:
+                                            return True
+                                except:
+                                    pass
+                                return False
+                            
+                            # Remove quotes from URL
+                            if url and is_quote_char(url[0]) and is_quote_char(url[-1]):
+                                url = url[1:-1]
+                            
+                            # Remove quotes from output directory
+                            if output_dir and is_quote_char(output_dir[0]) and is_quote_char(output_dir[-1]):
+                                output_dir = output_dir[1:-1]
+                            
+                            tasks.append((url, output_dir))
+                            continue
+                    except Exception as csv_error:
+                        logger.debug(f"Line {line_num}: Failed to parse as CSV: {csv_error}, trying other formats")
+                
+                # Try space/tab separated format
+                parts = line.split()
+                
+                if len(parts) >= 2:
+                    # Space/tab separated format
+                    url = parts[0]
+                    output_dir = parts[1]
+                    
+                    tasks.append((url, output_dir))
+                    continue
+                
+                # If we reach here, the line doesn't have enough parts
+                logger.warning(f"Line {line_num}: insufficient columns (expected at least 2, got {len(parts)}): {line}")
+        
+        if not tasks:
+            logger.error(f"No valid tasks found in list file: {list_file_path}")
+            return []
+        
+        # Process URLs: validate and add https:// if needed
+        processed_tasks = []
+        for url, output_dir in tasks:
+            # Validate URL format
+            if not url.startswith(('http://', 'https://')):
+                logger.warning(f"URL doesn't start with http:// or https://: {url}")
+                # Try to add https:// if missing
+                url = f"https://{url}"
+                logger.info(f"Trying with: {url}")
+            
+            processed_tasks.append((url, output_dir))
+        
+        logger.info(f"Loaded {len(processed_tasks)} tasks from list file: {list_file_path}")
+        return processed_tasks
+        
+    except FileNotFoundError:
+        logger.error(f"List file not found: {list_file_path}")
+        return []
+    except Exception as e:
+        logger.error(f"Error reading list file {list_file_path}: {e}")
+        return []
+
+
 async def extract_images_only(page, output_dir: Path, default_ext: str = 'jpg') -> dict:
     """
     Extract images from <pre> tags and save directly to output directory.
@@ -429,22 +594,37 @@ async def extract_images_only(page, output_dir: Path, default_ext: str = 'jpg') 
         return {'total': 0, 'success': 0, 'failed': 0}
 
 
-async def main_async(args):
-    """Main async function."""
+async def process_single_task(url: str, output_dir: str, timeout: int, user_agent: str, 
+                             proxy: str, ext: str, verbose: bool) -> dict:
+    """
+    Process a single URL task.
+    
+    Args:
+        url: URL to process
+        output_dir: Output directory for images
+        timeout: Navigation timeout in milliseconds
+        user_agent: Custom user agent string
+        proxy: Proxy URL
+        ext: Default file extension
+        verbose: Verbose logging flag
+        
+    Returns:
+        Dictionary with task statistics
+    """
     # Set logging level
-    if args.verbose:
+    if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.debug("Verbose mode enabled")
     
     # Validate URL
-    if not args.url.startswith(('http://', 'https://')):
-        logger.warning(f"URL doesn't start with http:// or https://: {args.url}")
+    if not url.startswith(('http://', 'https://')):
+        logger.warning(f"URL doesn't start with http:// or https://: {url}")
         # Try to add https:// if missing
-        args.url = f"https://{args.url}"
-        logger.info(f"Trying with: {args.url}")
+        url = f"https://{url}"
+        logger.info(f"Trying with: {url}")
     
     # Create output directory path
-    output_dir = Path(args.output_dir)
+    output_dir_path = Path(output_dir)
     
     playwright_instance = None
     browser = None
@@ -456,18 +636,18 @@ async def main_async(args):
         playwright_instance = await async_playwright().start()
         
         # Step 1: Create browser context and navigate to URL
-        logger.info(f"Creating browser context and navigating to {args.url}")
+        logger.info(f"Creating browser context and navigating to {url}")
         browser, context, page, html_content = await create_browser_context(
             playwright_instance,
-            args.url, 
-            timeout=args.timeout,
-            user_agent=args.user_agent,
-            proxy=args.proxy
+            url, 
+            timeout=timeout,
+            user_agent=user_agent,
+            proxy=proxy
         )
         
         # Step 2: Wait for images in <pre> tags to load
         logger.info("Waiting for images in <pre> tags to load...")
-        images_loaded = await wait_for_pre_images_loaded(page, timeout=args.timeout)
+        images_loaded = await wait_for_pre_images_loaded(page, timeout=timeout)
         
         if not images_loaded:
             logger.warning("Images may not have fully loaded, but will try to save what's available")
@@ -476,51 +656,36 @@ async def main_async(args):
         logger.info("Extracting images...")
         stats = await extract_images_only(
             page,
-            output_dir,
-            default_ext=args.ext
+            output_dir_path,
+            default_ext=ext
         )
         
         if stats['total'] == 0:
             # Fallback: try to extract URLs from HTML
             logger.warning("No images extracted, falling back to HTML extraction...")
-            img_urls = extract_img_urls_from_pre_tags(html_content, args.url)
+            img_urls = extract_img_urls_from_pre_tags(html_content, url)
             
             if img_urls:
                 logger.info(f"Found {len(img_urls)} image URLs in HTML")
                 print(f"Found {len(img_urls)} image URLs but could not extract them")
                 print("Image URLs found:")
-                for i, url in enumerate(img_urls, 1):
-                    print(f"  {i}. {url}")
+                for i, url_item in enumerate(img_urls, 1):
+                    print(f"  {i}. {url_item}")
             else:
                 logger.error("No images found in <pre> tags on the page")
                 print("No images found in <pre> tags on the page")
-            return
+            
+            stats['has_fallback_urls'] = bool(img_urls)
+            stats['fallback_urls'] = img_urls
         
-        # Print summary
-        print("\n" + "="*60)
-        print("IMAGE EXTRACTION SUMMARY")
-        print("="*60)
-        print(f"URL: {args.url}")
-        print(f"Images saved to: {output_dir.absolute()}")
-        print(f"Total images found: {stats['total']}")
-        print(f"Successfully extracted: {stats['success']}")
-        print(f"Failed extractions: {stats['failed']}")
-        if stats['total'] > 0:
-            print(f"Success rate: {stats['success']/stats['total']*100:.1f}%")
+        # Add URL and output directory to stats
+        stats['url'] = url
+        stats['output_dir'] = str(output_dir_path.absolute())
         
-        if stats['success'] > 0:
-            print(f"\nImages saved with filenames:")
-            # List saved files
-            for i in range(1, stats['success'] + 1):
-                filename = format_filename(i, stats['total'], args.ext)
-                filepath = output_dir / filename
-                if filepath.exists():
-                    print(f"  {filename} ({filepath.stat().st_size:,} bytes)")
-        
-        print("="*60)
+        return stats
         
     except Exception as e:
-        logger.error(f"Error in main process: {e}")
+        logger.error(f"Error processing {url}: {e}")
         raise
     finally:
         # Clean up browser resources
@@ -534,29 +699,219 @@ async def main_async(args):
             await playwright_instance.stop()
 
 
+async def process_batch_tasks(tasks: List[tuple], timeout: int, user_agent: str, 
+                             proxy: str, ext: str, verbose: bool) -> List[dict]:
+    """
+    Process multiple tasks in sequence.
+    
+    Args:
+        tasks: List of tuples (url, output_dir)
+        timeout: Navigation timeout in milliseconds
+        user_agent: Custom user agent string
+        proxy: Proxy URL
+        ext: Default file extension
+        verbose: Verbose logging flag
+        
+    Returns:
+        List of task statistics dictionaries
+    """
+    all_stats = []
+    
+    print("\n" + "="*60)
+    print("BATCH PROCESSING STARTED")
+    print("="*60)
+    print(f"Total tasks: {len(tasks)}")
+    print("="*60)
+    
+    for i, (url, output_dir) in enumerate(tasks, 1):
+        print(f"\n{'='*40}")
+        print(f"Processing task {i}/{len(tasks)}")
+        print(f"URL: {url}")
+        print(f"Output directory: {output_dir}")
+        print(f"{'='*40}\n")
+        
+        try:
+            stats = await process_single_task(
+                url=url,
+                output_dir=output_dir,
+                timeout=timeout,
+                user_agent=user_agent,
+                proxy=proxy,
+                ext=ext,
+                verbose=verbose
+            )
+            
+            all_stats.append(stats)
+            
+            # Print task summary
+            print(f"\nTask {i} completed:")
+            print(f"  URL: {url}")
+            print(f"  Output directory: {output_dir}")
+            print(f"  Images found: {stats.get('total', 0)}")
+            print(f"  Successfully extracted: {stats.get('success', 0)}")
+            print(f"  Failed extractions: {stats.get('failed', 0)}")
+            if stats.get('total', 0) > 0:
+                print(f"  Success rate: {stats.get('success', 0)/stats.get('total', 0)*100:.1f}%")
+            
+            # Add delay between tasks to avoid rate limiting
+            if i < len(tasks):
+                print(f"\nWaiting 2 seconds before next task...")
+                await asyncio.sleep(2)
+                
+        except Exception as e:
+            logger.error(f"Failed to process task {i} ({url}): {e}")
+            print(f"\nTask {i} failed: {e}")
+            all_stats.append({
+                'url': url,
+                'output_dir': output_dir,
+                'error': str(e),
+                'total': 0,
+                'success': 0,
+                'failed': 0
+            })
+    
+    return all_stats
+
+
+async def main_async(args):
+    """Main async function."""
+    # Check if we're in batch mode or single mode
+    if args.list_file:
+        # Batch mode
+        tasks = read_list_file(args.list_file)
+        
+        if not tasks:
+            logger.error("No valid tasks found in list file. Exiting.")
+            return
+        
+        # Process all tasks
+        all_stats = await process_batch_tasks(
+            tasks=tasks,
+            timeout=args.timeout,
+            user_agent=args.user_agent,
+            proxy=args.proxy,
+            ext=args.ext,
+            verbose=args.verbose
+        )
+        
+        # Print batch summary
+        print("\n" + "="*60)
+        print("BATCH PROCESSING SUMMARY")
+        print("="*60)
+        
+        total_tasks = len(all_stats)
+        successful_tasks = sum(1 for stats in all_stats if stats.get('success', 0) > 0 or stats.get('has_fallback_urls', False))
+        failed_tasks = total_tasks - successful_tasks
+        
+        total_images = sum(stats.get('total', 0) for stats in all_stats)
+        total_success = sum(stats.get('success', 0) for stats in all_stats)
+        total_failed = sum(stats.get('failed', 0) for stats in all_stats)
+        
+        print(f"Total tasks processed: {total_tasks}")
+        print(f"Successful tasks: {successful_tasks}")
+        print(f"Failed tasks: {failed_tasks}")
+        print(f"Total images found: {total_images}")
+        print(f"Total successfully extracted: {total_success}")
+        print(f"Total failed extractions: {total_failed}")
+        
+        if total_images > 0:
+            print(f"Overall success rate: {total_success/total_images*100:.1f}%")
+        
+        print("\nTask details:")
+        for i, stats in enumerate(all_stats, 1):
+            if 'error' in stats:
+                print(f"  {i}. {stats['url']} - ERROR: {stats['error']}")
+            elif stats.get('has_fallback_urls', False):
+                print(f"  {i}. {stats['url']} - Found {len(stats.get('fallback_urls', []))} URLs (not extracted)")
+            else:
+                print(f"  {i}. {stats['url']} - {stats.get('success', 0)}/{stats.get('total', 0)} images extracted")
+        
+        print("="*60)
+        
+    else:
+        # Single mode
+        if not args.url or not args.output_dir:
+            logger.error("Both URL and output_dir are required in single mode")
+            print("Error: Both URL and output_dir are required in single mode")
+            print("Usage: python getimgfromurl.py <url> <output_dir> [options]")
+            return
+        
+        stats = await process_single_task(
+            url=args.url,
+            output_dir=args.output_dir,
+            timeout=args.timeout,
+            user_agent=args.user_agent,
+            proxy=args.proxy,
+            ext=args.ext,
+            verbose=args.verbose
+        )
+        
+        # Print summary for single task
+        if stats.get('total', 0) == 0 and not stats.get('has_fallback_urls', False):
+            return
+        
+        print("\n" + "="*60)
+        print("IMAGE EXTRACTION SUMMARY")
+        print("="*60)
+        print(f"URL: {stats['url']}")
+        print(f"Images saved to: {stats['output_dir']}")
+        print(f"Total images found: {stats.get('total', 0)}")
+        print(f"Successfully extracted: {stats.get('success', 0)}")
+        print(f"Failed extractions: {stats.get('failed', 0)}")
+        if stats.get('total', 0) > 0:
+            print(f"Success rate: {stats.get('success', 0)/stats.get('total', 0)*100:.1f}%")
+        
+        if stats.get('success', 0) > 0:
+            print(f"\nImages saved with filenames:")
+            # List saved files
+            output_dir_path = Path(stats['output_dir'])
+            for i in range(1, stats.get('success', 0) + 1):
+                filename = format_filename(i, stats.get('total', 0), args.ext)
+                filepath = output_dir_path / filename
+                if filepath.exists():
+                    print(f"  {filename} ({filepath.stat().st_size:,} bytes)")
+        
+        print("="*60)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
         description='Download all images from <img> tags within <pre> tags on a webpage',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
+  # Single URL mode
   %(prog)s https://example.com ./output
   %(prog)s https://example.com ./output --timeout 30000
   %(prog)s https://example.com ./output --user-agent "Custom Agent"
   %(prog)s https://example.com ./output --ext png
   %(prog)s https://example.com ./output --proxy http://proxy.example.com:8080
   %(prog)s https://example.com ./output --verbose
+  
+  # Batch mode with list file
+  %(prog)s --list urls.txt
         """
     )
     
-    parser.add_argument(
+    # Mutually exclusive group for single URL vs batch mode
+    group = parser.add_mutually_exclusive_group(required=True)
+    
+    group.add_argument(
         'url',
-        help='URL of the web page to fetch images from'
+        nargs='?',
+        help='URL of the web page to fetch images from (single mode)'
+    )
+    
+    group.add_argument(
+        '--list',
+        dest='list_file',
+        help='List file for batch processing (each line: URL output_dir)'
     )
     
     parser.add_argument(
         'output_dir',
-        help='Directory where images will be saved'
+        nargs='?',
+        help='Directory where images will be saved (single mode)'
     )
     
     parser.add_argument(
@@ -595,17 +950,9 @@ def main():
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     
-    loop = None
     try:
-        # Get or create event loop
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
         # Run the main async function
-        loop.run_until_complete(main_async(args))
+        asyncio.run(main_async(args))
         
     except KeyboardInterrupt:
         logger.info("Operation cancelled by user")
@@ -613,26 +960,6 @@ def main():
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         sys.exit(1)
-    finally:
-        # Clean up the event loop
-        if loop:
-            try:
-                # Cancel all running tasks
-                tasks = asyncio.all_tasks(loop)
-                for task in tasks:
-                    task.cancel()
-                
-                # Run loop until all tasks are cancelled
-                if tasks:
-                    loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-                
-                # Shutdown async generators
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                
-                # Close the loop
-                loop.close()
-            except Exception:
-                pass  # Ignore errors during cleanup
 
 
 if __name__ == "__main__":
